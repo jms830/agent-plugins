@@ -281,20 +281,69 @@ def init(
             else:
                 console.print(f"[yellow]⚠[/yellow] {agent['name']}: skills exists (use --force)")
         
-        # Plugins/marketplaces symlink (only for agents that support it)
-        if agent["supports_plugins"] and agent["plugins_dir"]:
+        # Sync plugins (if supported)
+        if agent_config["supports_plugins"] and agent_config["plugins_dir"]:
             source = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
-            target = agent["home"] / agent["plugins_dir"]
+            target = agent_config["home"] / agent_config["plugins_dir"]
             
             if target.is_symlink() and target.resolve() == source.resolve():
-                console.print(f"[dim]  {agent['name']}: marketplaces already linked[/dim]")
+                console.print(f"  [dim]Marketplaces already linked[/dim]")
             elif create_symlink(source, target, force=force):
-                console.print(f"[green]✓[/green] {agent['name']}: marketplaces → {target}")
+                console.print(f"  [green]✓[/green] Marketplaces linked")
+
+        # Sync commands (for OpenCode specifically)
+        if agent_key == "opencode":
+             if agent_config.get("supports_commands"):
+                console.print("  [dim]Syncing OpenCode commands...[/dim]")
+                sync_opencode_commands(force)
+             else:
+                console.print("  [dim]OpenCode commands not supported?[/dim]")
+
+    console.print("[green]Sync complete![/green]")
+
+
+def sync_opencode_commands(force: bool):
+    """Sync commands from marketplaces to OpenCode's command directory."""
+    marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
+    opencode_cmd_dir = Path.home() / ".config" / "opencode" / "command"
     
-    console.print("\n[bold green]Initialization complete![/bold green]")
-    console.print("\nNext steps:")
-    console.print("  agent-plugins marketplace add <github-repo>")
-    console.print("  agent-plugins list")
+    if not marketplaces_dir.exists():
+        return
+
+    opencode_cmd_dir.mkdir(parents=True, exist_ok=True)
+    console.print("  [cyan]Syncing commands to OpenCode...[/cyan]")
+    
+    count = 0
+    # Walk marketplaces to find commands
+    for mp_dir in marketplaces_dir.iterdir():
+        if not mp_dir.is_dir() or mp_dir.name.startswith("."):
+            continue
+            
+        # 1. Direct commands folder
+        commands_dir = mp_dir / "commands"
+        if commands_dir.exists():
+            for cmd_file in commands_dir.glob("*.md"):
+                dest_name = f"claude-{mp_dir.name}-{cmd_file.name}"
+                dest_path = opencode_cmd_dir / dest_name
+                shutil.copy2(cmd_file, dest_path)
+                count += 1
+        
+        # 2. Nested plugin commands
+        plugins_dir = mp_dir / "plugins"
+        if plugins_dir.exists():
+            for plugin_dir in plugins_dir.iterdir():
+                if plugin_dir.is_dir():
+                    cmds_dir = plugin_dir / "commands"
+                    if cmds_dir.exists():
+                        for cmd_file in cmds_dir.glob("*.md"):
+                            # Format: claude-marketplace-plugin-command.md
+                            dest_name = f"claude-{mp_dir.name}-{plugin_dir.name}-{cmd_file.name}"
+                            dest_path = opencode_cmd_dir / dest_name
+                            shutil.copy2(cmd_file, dest_path)
+                            count += 1
+                            
+    console.print(f"  [green]✓[/green] Synced {count} commands to {opencode_cmd_dir}")
+
 
 
 @app.command()
@@ -593,7 +642,7 @@ def sync(
         console.print(f"[cyan]Syncing to {agent_config['name']}...[/cyan]")
         
         # Sync skills
-        if agent_config["supports_skills"]:
+        if agent_config.get("supports_skills"):
             source = AGENT_PLUGINS_HOME / "skills"
             target = agent_config["home"] / agent_config["skills_dir"]
             
@@ -601,7 +650,21 @@ def sync(
                 console.print(f"  [green]✓[/green] Skills linked")
             elif target.is_symlink():
                 console.print(f"  [dim]Skills already linked[/dim]")
-    
+        
+        # Sync plugins (if supported)
+        if agent_config.get("supports_plugins") and agent_config.get("plugins_dir"):
+            source = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
+            target = agent_config["home"] / agent_config["plugins_dir"]
+            
+            if target.is_symlink() and target.resolve() == source.resolve():
+                console.print(f"  [dim]Marketplaces already linked[/dim]")
+            elif create_symlink(source, target, force=force):
+                console.print(f"  [green]✓[/green] Marketplaces linked")
+
+        # Sync commands (for OpenCode specifically)
+        if agent_key == "opencode" and agent_config.get("supports_commands"):
+            sync_opencode_commands(force)
+
     console.print("[green]Sync complete![/green]")
 
 
