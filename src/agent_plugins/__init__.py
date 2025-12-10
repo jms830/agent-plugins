@@ -657,6 +657,254 @@ def install_builtin_commands():
     return count
 
 
+def get_known_marketplaces_path() -> Path:
+    """Get the path to the known_marketplaces.json file."""
+    return AGENT_PLUGINS_HOME / "known_marketplaces.json"
+
+
+def load_known_marketplaces() -> Dict[str, Any]:
+    """Load the known marketplaces metadata.
+    
+    This file tracks marketplace sources and is compatible with Claude's format.
+    """
+    mp_path = get_known_marketplaces_path()
+    if mp_path.exists():
+        try:
+            with open(mp_path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_known_marketplaces(marketplaces: Dict[str, Any]):
+    """Save the known marketplaces metadata."""
+    mp_path = get_known_marketplaces_path()
+    mp_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(mp_path, "w") as f:
+        json.dump(marketplaces, f, indent=2)
+
+
+def get_installed_plugins_paths() -> List[Path]:
+    """Get paths to installed_plugins JSON files."""
+    return [
+        AGENT_PLUGINS_HOME / "installed_plugins.json",
+        AGENT_PLUGINS_HOME / "installed_plugins_v2.json",
+    ]
+
+
+def backup_file_with_date(file_path: Path) -> Optional[Path]:
+    """Create a backup of a file with date suffix.
+    
+    Returns the backup path if created, None otherwise.
+    """
+    if not file_path.exists() or file_path.is_symlink():
+        return None
+    
+    from datetime import datetime
+    date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = file_path.with_suffix(f".json.bak.{date_suffix}")
+    shutil.copy2(file_path, backup_path)
+    return backup_path
+
+
+def setup_marketplace_metadata_symlinks(force: bool = False) -> Dict[str, str]:
+    """Set up symlinks for marketplace metadata files from Claude to agent-plugins.
+    
+    This makes ~/.agent/ the source of truth for marketplace metadata while
+    maintaining compatibility with Claude Code's plugin system.
+    
+    Files handled:
+    - known_marketplaces.json - tracks marketplace sources
+    - installed_plugins.json - tracks installed plugins (v1)
+    - installed_plugins_v2.json - tracks installed plugins (v2)
+    
+    Returns dict of actions taken: {filename: action}
+    """
+    results = {}
+    claude_plugins_dir = AGENT_CONFIG["claude"]["home"] / "plugins"
+    
+    # Files to symlink
+    metadata_files = [
+        "known_marketplaces.json",
+        "installed_plugins.json",
+        "installed_plugins_v2.json",
+    ]
+    
+    for filename in metadata_files:
+        claude_file = claude_plugins_dir / filename
+        agent_file = AGENT_PLUGINS_HOME / filename
+        
+        # Skip if Claude file doesn't exist
+        if not claude_file.exists() and not claude_file.is_symlink():
+            # Create empty file in agent-plugins if it doesn't exist
+            if not agent_file.exists():
+                agent_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(agent_file, "w") as f:
+                    json.dump({}, f)
+                results[filename] = "created_empty"
+            continue
+        
+        # If Claude file is already a symlink pointing to our file, skip
+        if claude_file.is_symlink():
+            if claude_file.resolve() == agent_file.resolve():
+                results[filename] = "already_linked"
+                continue
+            elif force:
+                claude_file.unlink()
+            else:
+                results[filename] = "symlink_exists_different_target"
+                continue
+        
+        # Claude file exists and is a real file
+        # Step 1: If agent file doesn't exist, copy Claude's file to agent location
+        if not agent_file.exists():
+            agent_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(claude_file, agent_file)
+            results[filename] = "copied_from_claude"
+        elif force:
+            # Merge: Claude's entries take precedence for conflicts
+            try:
+                with open(agent_file, "r") as f:
+                    agent_data = json.load(f)
+                with open(claude_file, "r") as f:
+                    claude_data = json.load(f)
+                # Merge (Claude overwrites conflicts)
+                merged = {**agent_data, **claude_data}
+                with open(agent_file, "w") as f:
+                    json.dump(merged, f, indent=2)
+                results[filename] = "merged"
+            except (json.JSONDecodeError, IOError):
+                shutil.copy2(claude_file, agent_file)
+                results[filename] = "copied_from_claude"
+        
+        # Step 2: Backup Claude's file
+        backup_path = backup_file_with_date(claude_file)
+        if backup_path:
+            results[f"{filename}_backup"] = str(backup_path)
+        
+        # Step 3: Replace Claude's file with symlink to agent file
+        if claude_file.exists() and not claude_file.is_symlink():
+            claude_file.unlink()
+        
+        claude_plugins_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            claude_file.symlink_to(agent_file)
+            if "copied" not in results.get(filename, "") and "merged" not in results.get(filename, ""):
+                results[filename] = "symlinked"
+            else:
+                results[filename] += "_and_symlinked"
+        except OSError as e:
+            results[filename] = f"symlink_failed: {e}"
+    
+    return results
+
+
+def import_marketplaces(source: Optional[str] = None) -> Dict[str, Any]:
+    """Import and clone missing marketplaces from metadata.
+    
+    Reads known_marketplaces.json and clones any marketplaces that are
+    recorded but don't exist on disk.
+    
+    Args:
+        source: Optional filter - only import from specific source (e.g., "claude")
+                Currently only "claude" is supported.
+    
+    Returns dict with import results:
+        {
+            "imported": [...],  # Successfully cloned
+            "skipped": [...],   # Already existed
+            "failed": [...],    # Failed to clone
+        }
+    """
+    results = {
+        "imported": [],
+        "skipped": [],
+        "failed": [],
+    }
+    
+    marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
+    marketplaces_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load known marketplaces
+    known = load_known_marketplaces()
+    
+    if not known:
+        return results
+    
+    for mp_name, mp_info in known.items():
+        target_dir = marketplaces_dir / mp_name
+        
+        # Skip if already exists
+        if target_dir.exists():
+            results["skipped"].append(mp_name)
+            continue
+        
+        # Get git URL from source info
+        source_info = mp_info.get("source", {})
+        git_url = None
+        
+        if source_info.get("source") == "git":
+            git_url = source_info.get("url")
+        elif source_info.get("source") == "github":
+            repo = source_info.get("repo")
+            if repo:
+                git_url = f"https://github.com/{repo}.git"
+        
+        if not git_url:
+            results["failed"].append({"name": mp_name, "error": "No git URL found"})
+            continue
+        
+        # Clone the repository
+        console.print(f"[cyan]Cloning {mp_name}...[/cyan]")
+        try:
+            clone_url = get_authenticated_git_url(git_url)
+            subprocess.run(
+                ["git", "clone", "--depth", "1", clone_url, str(target_dir)],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            results["imported"].append(mp_name)
+            console.print(f"[green]✓[/green] Imported {mp_name}")
+        except subprocess.CalledProcessError as e:
+            results["failed"].append({"name": mp_name, "error": str(e.stderr)[:100]})
+            console.print(f"[red]✗[/red] Failed to import {mp_name}: {e.stderr[:100]}")
+    
+    return results
+
+
+def add_to_known_marketplaces(
+    name: str,
+    git_url: str,
+    install_location: Path,
+    source_type: str = "git"
+) -> None:
+    """Add a marketplace to known_marketplaces.json.
+    
+    Uses Claude-compatible format for interoperability.
+    """
+    from datetime import datetime
+    
+    known = load_known_marketplaces()
+    
+    # Determine source format
+    if source_type == "github" and "github.com" in git_url:
+        # Extract owner/repo from GitHub URL
+        parts = git_url.replace(".git", "").split("github.com/")[-1].strip("/")
+        source = {"source": "github", "repo": parts}
+    else:
+        source = {"source": "git", "url": git_url}
+    
+    known[name] = {
+        "source": source,
+        "installLocation": str(install_location),
+        "lastUpdated": datetime.utcnow().isoformat() + "Z",
+    }
+    
+    save_known_marketplaces(known)
+
+
 def is_junction(path: Path) -> bool:
     """Check if a path is a Windows junction point."""
     if sys.platform != "win32":
@@ -915,6 +1163,46 @@ def init(
                 console.print(f"  [dim]Hooks already linked[/dim]")
             elif create_link(source, target, force=force):
                 console.print(f"  [green]✓[/green] Hooks linked")
+
+    # Set up marketplace metadata symlinks (Claude integration)
+    if "claude" in enabled:
+        console.print("\n[cyan]Setting up marketplace metadata sync...[/cyan]")
+        metadata_results = setup_marketplace_metadata_symlinks(force=force)
+        
+        for filename, action in metadata_results.items():
+            if "_backup" in filename:
+                console.print(f"  [dim]Backed up {filename.replace('_backup', '')}: {action}[/dim]")
+            elif action == "already_linked":
+                console.print(f"  [dim]{filename}: already linked[/dim]")
+            elif "symlinked" in action or "copied" in action:
+                console.print(f"  [green]✓[/green] {filename}: {action}")
+            elif "failed" in action:
+                console.print(f"  [yellow]⚠[/yellow] {filename}: {action}")
+    
+    # Auto-import missing marketplaces
+    known = load_known_marketplaces()
+    if known:
+        marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
+        missing = [name for name in known.keys() if not (marketplaces_dir / name).exists()]
+        
+        if missing:
+            console.print(f"\n[cyan]Importing {len(missing)} missing marketplace(s)...[/cyan]")
+            import_results = import_marketplaces()
+            
+            if import_results["imported"]:
+                console.print(f"[green]✓[/green] Imported: {', '.join(import_results['imported'])}")
+            if import_results["failed"]:
+                failed_names = [f["name"] for f in import_results["failed"]]
+                console.print(f"[yellow]⚠[/yellow] Failed to import: {', '.join(failed_names)}")
+            
+            # Extract components from newly imported marketplaces
+            if import_results["imported"]:
+                console.print("\n[cyan]Extracting components from imported marketplaces...[/cyan]")
+                skills = extract_skills_from_marketplaces()
+                agents_count = extract_agents_from_marketplaces()
+                commands = extract_commands_from_marketplaces()
+                hooks = extract_hooks_from_marketplaces()
+                console.print(f"[green]✓[/green] Extracted {skills} skills, {agents_count} agents, {commands} commands, {hooks} hooks")
 
     console.print("\n[green]✓ Initialization complete![/green]")
 
@@ -1256,6 +1544,74 @@ def extract(
     console.print(f"\n[green]✓ Extracted {total} total components to {AGENT_PLUGINS_HOME}[/green]")
 
 
+@app.command(name="import")
+def import_cmd(
+    source: Optional[str] = typer.Option(
+        None, "--from", "-f",
+        help="Import from specific agent (currently only 'claude' supported)"
+    ),
+    extract_after: bool = typer.Option(
+        True, "--extract/--no-extract",
+        help="Extract components after importing"
+    ),
+):
+    """
+    Import marketplaces from other agents' configurations.
+    
+    This reads known_marketplaces.json and clones any marketplaces
+    that are registered but don't exist on disk.
+    
+    Examples:
+        agent-plugins import              # Import all missing marketplaces
+        agent-plugins import --from claude  # Import only from Claude's config
+        agent-plugins import --no-extract   # Skip component extraction
+    """
+    console.print("[cyan]Importing marketplaces...[/cyan]\n")
+    
+    # First, ensure metadata symlinks are set up
+    console.print("[dim]Checking metadata sync...[/dim]")
+    setup_marketplace_metadata_symlinks(force=False)
+    
+    # Load known marketplaces
+    known = load_known_marketplaces()
+    
+    if not known:
+        console.print("[yellow]No marketplaces found in known_marketplaces.json[/yellow]")
+        console.print("[dim]Try adding one with: agent-plugins marketplace add <repo>[/dim]")
+        return
+    
+    console.print(f"Found {len(known)} registered marketplace(s)\n")
+    
+    # Import missing marketplaces
+    results = import_marketplaces(source=source)
+    
+    # Summary
+    console.print("")
+    if results["imported"]:
+        console.print(f"[green]✓ Imported:[/green] {', '.join(results['imported'])}")
+    if results["skipped"]:
+        console.print(f"[dim]Skipped (already exist):[/dim] {', '.join(results['skipped'])}")
+    if results["failed"]:
+        console.print(f"[yellow]Failed:[/yellow]")
+        for f in results["failed"]:
+            console.print(f"  - {f['name']}: {f['error']}")
+    
+    # Extract components if requested and we imported something
+    if extract_after and results["imported"]:
+        console.print("\n[cyan]Extracting components from imported marketplaces...[/cyan]")
+        skills = extract_skills_from_marketplaces()
+        agents_count = extract_agents_from_marketplaces()
+        commands = extract_commands_from_marketplaces()
+        hooks = extract_hooks_from_marketplaces()
+        console.print(f"[green]✓[/green] Extracted {skills} skills, {agents_count} agents, {commands} commands, {hooks} hooks")
+    
+    total_imported = len(results["imported"])
+    if total_imported > 0:
+        console.print(f"\n[green]✓ Import complete! {total_imported} marketplace(s) imported.[/green]")
+    else:
+        console.print("\n[dim]No new marketplaces to import.[/dim]")
+
+
 @app.command(name="list")
 def list_plugins():
     """List all installed plugins, skills, and commands."""
@@ -1591,6 +1947,11 @@ def marketplace_add(
         )
         console.print(f"[green]✓[/green] Added marketplace: {repo_name}")
         
+        # Add to known_marketplaces.json for Claude compatibility
+        source_type = "github" if "github.com" in git_url else "git"
+        add_to_known_marketplaces(repo_name, git_url, target_dir, source_type)
+        console.print(f"  [dim]Registered in known_marketplaces.json[/dim]")
+        
         # Show what was added
         mp_json = target_dir / ".claude-plugin" / "marketplace.json"
         if mp_json.exists():
@@ -1617,6 +1978,14 @@ def marketplace_remove(
         raise typer.Exit(1)
     
     shutil.rmtree(target_dir)
+    
+    # Remove from known_marketplaces.json
+    known = load_known_marketplaces()
+    if name in known:
+        del known[name]
+        save_known_marketplaces(known)
+        console.print(f"  [dim]Removed from known_marketplaces.json[/dim]")
+    
     console.print(f"[green]✓[/green] Removed marketplace: {name}")
 
 
