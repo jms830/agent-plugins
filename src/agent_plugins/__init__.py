@@ -506,7 +506,10 @@ def main_callback(ctx: typer.Context):
         console.print("\n[dim]Run 'agent-plugins --help' for usage information[/dim]")
 
 # Sub-app for marketplace commands
-marketplace_app = typer.Typer(help="Manage plugin marketplaces")
+marketplace_app = typer.Typer(
+    help="Manage plugin marketplaces",
+    no_args_is_help=True,
+)
 app.add_typer(marketplace_app, name="marketplace")
 
 
