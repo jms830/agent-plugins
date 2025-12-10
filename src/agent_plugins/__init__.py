@@ -503,7 +503,7 @@ def main_callback(ctx: typer.Context):
     """
     if ctx.invoked_subcommand is None:
         show_banner()
-        console.print("\n[dim]Run 'agent-plugins --help' for usage information[/dim]")
+        console.print(ctx.get_help())
 
 # Sub-app for marketplace commands
 marketplace_app = typer.Typer(
