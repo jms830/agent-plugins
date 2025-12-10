@@ -30,8 +30,8 @@ dependencies = [
 agent-plugins = "agent_plugins:main"
 
 [project.urls]
-Homepage = "https://github.com/jordan/agent-plugins"
-Repository = "https://github.com/jordan/agent-plugins"
+Homepage = "https://github.com/jasonkneen/agent-plugins"
+Repository = "https://github.com/jasonkneen/agent-plugins"
 
 [build-system]
 requires = ["hatchling"]

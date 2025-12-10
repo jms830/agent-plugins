@@ -26,10 +26,43 @@ from typing import Optional, Dict, List, Any
 
 import typer
 import yaml
+import httpx
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
+
+
+# =============================================================================
+# GitHub API Helpers
+# =============================================================================
+
+def get_github_token(cli_token: Optional[str] = None) -> Optional[str]:
+    """Return GitHub token from CLI arg, GH_TOKEN, or GITHUB_TOKEN env var."""
+    token = (cli_token or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()
+    return token if token else None
+
+
+def get_github_auth_headers(cli_token: Optional[str] = None) -> Dict[str, str]:
+    """Return Authorization header dict if token exists."""
+    token = get_github_token(cli_token)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def get_authenticated_git_url(url: str, token: Optional[str] = None) -> str:
+    """Convert GitHub URL to authenticated URL if token available.
+    
+    This embeds the token in the URL for git clone operations,
+    which helps with rate limits and private repos.
+    """
+    token = get_github_token(token)
+    if not token:
+        return url
+    
+    # Convert https://github.com/user/repo.git to https://TOKEN@github.com/user/repo.git
+    if url.startswith("https://github.com/"):
+        return url.replace("https://github.com/", f"https://{token}@github.com/")
+    return url
 
 # =============================================================================
 # Constants & Agent Configuration
@@ -38,14 +71,23 @@ from rich.tree import Tree
 # Canonical location for agent-plugins (source of truth)
 AGENT_PLUGINS_HOME = Path.home() / ".agent"
 
+# Claude local path after `claude migrate-installer` (removes from PATH, creates alias here)
+CLAUDE_LOCAL_PATH = Path.home() / ".claude" / "local" / "claude"
+
 # Agent-specific configurations (mirrors spec-kit's approach)
+# See: https://github.com/github/spec-kit for reference
 AGENT_CONFIG = {
     "claude": {
         "name": "Claude Code",
         "home": Path.home() / ".claude",
         "skills_dir": "skills",
         "plugins_dir": "plugins/marketplaces",
+        "agents_dir": "agents",
+        "commands_dir": "commands",
+        "hooks_dir": "hooks",
         "project_dir": ".claude",
+        "install_url": "https://docs.anthropic.com/en/docs/claude-code/setup",
+        "requires_cli": True,
         "supports_plugins": True,
         "supports_skills": True,
         "supports_commands": True,
@@ -56,11 +98,17 @@ AGENT_CONFIG = {
         "name": "OpenCode",
         "home": Path.home() / ".opencode",
         "skills_dir": "skills",
-        "plugins_dir": None,  # No native plugin system
+        "plugins_dir": None,
+        "agents_dir": None,
+        "commands_dir": None,  # Uses ~/.config/opencode/command/ instead
+        "commands_alt_dir": Path.home() / ".config" / "opencode" / "command",
+        "hooks_dir": None,
         "project_dir": ".opencode",
+        "install_url": "https://opencode.ai",
+        "requires_cli": True,
         "supports_plugins": False,
-        "supports_skills": True,  # Via opencode-skills plugin
-        "supports_commands": True,  # Via ~/.config/opencode/command/
+        "supports_skills": True,
+        "supports_commands": True,
         "supports_agents": False,
         "supports_hooks": False,
     },
@@ -70,6 +118,8 @@ AGENT_CONFIG = {
         "skills_dir": "skills",
         "plugins_dir": None,
         "project_dir": ".codex",
+        "install_url": "https://github.com/openai/codex",
+        "requires_cli": True,
         "supports_plugins": False,
         "supports_skills": True,
         "supports_commands": False,
@@ -82,8 +132,164 @@ AGENT_CONFIG = {
         "skills_dir": "skills",
         "plugins_dir": None,
         "project_dir": ".gemini",
+        "install_url": "https://github.com/google-gemini/gemini-cli",
+        "requires_cli": True,
         "supports_plugins": False,
-        "supports_skills": True,  # Assuming similar SKILL.md support
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "cursor": {
+        "name": "Cursor",
+        "home": Path.home() / ".cursor",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".cursor",
+        "install_url": None,  # IDE-based
+        "requires_cli": False,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "windsurf": {
+        "name": "Windsurf",
+        "home": Path.home() / ".windsurf",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".windsurf",
+        "install_url": None,  # IDE-based
+        "requires_cli": False,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "copilot": {
+        "name": "GitHub Copilot",
+        "home": Path.home() / ".github",
+        "skills_dir": None,
+        "plugins_dir": None,
+        "project_dir": ".github",
+        "install_url": None,  # IDE-based
+        "requires_cli": False,
+        "supports_plugins": False,
+        "supports_skills": False,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "qwen": {
+        "name": "Qwen Code",
+        "home": Path.home() / ".qwen",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".qwen",
+        "install_url": "https://github.com/QwenLM/qwen-code",
+        "requires_cli": True,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "kilocode": {
+        "name": "Kilo Code",
+        "home": Path.home() / ".kilocode",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".kilocode",
+        "install_url": None,  # IDE-based
+        "requires_cli": False,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "auggie": {
+        "name": "Auggie CLI",
+        "home": Path.home() / ".augment",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".augment",
+        "install_url": "https://docs.augmentcode.com/cli/setup-auggie/install-auggie-cli",
+        "requires_cli": True,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "codebuddy": {
+        "name": "CodeBuddy",
+        "home": Path.home() / ".codebuddy",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".codebuddy",
+        "install_url": "https://www.codebuddy.ai/cli",
+        "requires_cli": True,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "roo": {
+        "name": "Roo Code",
+        "home": Path.home() / ".roo",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".roo",
+        "install_url": None,  # IDE-based
+        "requires_cli": False,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "q": {
+        "name": "Amazon Q Developer CLI",
+        "home": Path.home() / ".amazonq",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".amazonq",
+        "install_url": "https://aws.amazon.com/developer/learning/q-developer-cli/",
+        "requires_cli": True,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "amp": {
+        "name": "Amp",
+        "home": Path.home() / ".agents",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".agents",
+        "install_url": "https://ampcode.com/manual#install",
+        "requires_cli": True,
+        "supports_plugins": False,
+        "supports_skills": True,
+        "supports_commands": False,
+        "supports_agents": False,
+        "supports_hooks": False,
+    },
+    "shai": {
+        "name": "SHAI",
+        "home": Path.home() / ".shai",
+        "skills_dir": "skills",
+        "plugins_dir": None,
+        "project_dir": ".shai",
+        "install_url": "https://github.com/ovh/shai",
+        "requires_cli": True,
+        "supports_plugins": False,
+        "supports_skills": True,
         "supports_commands": False,
         "supports_agents": False,
         "supports_hooks": False,
@@ -154,7 +360,16 @@ def save_config(config: Dict[str, Any]):
 
 
 def check_agent_installed(agent_key: str) -> bool:
-    """Check if an agent CLI is installed."""
+    """Check if an agent CLI is installed.
+    
+    Special handling for Claude after `claude migrate-installer` which
+    removes the original executable from PATH and creates an alias at
+    ~/.claude/local/claude instead.
+    """
+    # Special case: Claude migrated installer
+    if agent_key == "claude":
+        if CLAUDE_LOCAL_PATH.exists() and CLAUDE_LOCAL_PATH.is_file():
+            return True
     return shutil.which(agent_key) is not None
 
 
@@ -171,22 +386,86 @@ def get_installed_agents() -> List[str]:
 
 
 def ensure_directory_structure():
-    """Ensure the agent-plugins directory structure exists."""
+    """Ensure the agent-plugins directory structure exists.
+    
+    Creates the full Claude-compatible directory structure:
+    ~/.agent/
+    ├── plugins/
+    │   └── marketplaces/     # Git repos with marketplace.json
+    ├── skills/               # SKILL.md files
+    ├── agents/               # Agent definitions
+    ├── commands/             # Slash commands
+    └── hooks/                # Hook scripts
+    """
     dirs = [
         AGENT_PLUGINS_HOME,
         AGENT_PLUGINS_HOME / "plugins" / "marketplaces",
         AGENT_PLUGINS_HOME / "skills",
+        AGENT_PLUGINS_HOME / "agents",
+        AGENT_PLUGINS_HOME / "commands",
+        AGENT_PLUGINS_HOME / "hooks",
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
 
-def create_symlink(source: Path, target: Path, force: bool = False):
-    """Create a symlink from target to source."""
-    if target.exists() or target.is_symlink():
+def is_junction(path: Path) -> bool:
+    """Check if a path is a Windows junction point."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        return attrs != -1 and (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+    except Exception:
+        return False
+
+
+def create_junction(source: Path, target: Path) -> bool:
+    """Create a Windows junction point (directory symlink that doesn't need admin).
+    
+    Junction points work without elevation and are transparent to applications.
+    They only work for directories on the same volume.
+    """
+    if sys.platform != "win32":
+        return False
+    
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(target), str(source)],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def create_link(source: Path, target: Path, force: bool = False) -> bool:
+    """Create a directory link from target to source.
+    
+    Link creation strategy (in order):
+    1. Try native symlink (works on Unix, Windows with Developer Mode)
+    2. On Windows: Try junction point (no elevation needed, transparent to apps)
+    3. Fallback: Copy files (last resort)
+    
+    Args:
+        source: The source path (what we're linking TO) - must be a directory
+        target: The target path (where the link will be created)
+        force: Whether to overwrite existing files/links
+        
+    Returns:
+        True if link/copy was created, False if skipped
+    """
+    # Handle existing target
+    if target.exists() or target.is_symlink() or is_junction(target):
         if force:
             if target.is_symlink():
                 target.unlink()
+            elif is_junction(target):
+                # Junctions are removed like directories on Windows
+                target.rmdir()
             elif target.is_dir():
                 shutil.rmtree(target)
             else:
@@ -196,8 +475,36 @@ def create_symlink(source: Path, target: Path, force: bool = False):
             return False
     
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.symlink_to(source)
+    
+    # Strategy 1: Try native symlink first
+    # Works on: Linux, macOS, Windows with Developer Mode enabled
+    try:
+        target.symlink_to(source)
+        return True
+    except OSError:
+        pass
+    
+    # Strategy 2: On Windows, try junction point (no admin needed)
+    # Junctions are transparent to applications - Claude/Codex/Gemini work perfectly
+    if sys.platform == "win32" and source.is_dir():
+        if create_junction(source, target):
+            console.print(f"[dim]  (using junction point)[/dim]")
+            return True
+    
+    # Strategy 3: Last resort - copy files
+    # This ensures it always works, even in edge cases
+    if source.is_dir():
+        shutil.copytree(source, target)
+    else:
+        shutil.copy2(source, target)
+    console.print(f"[dim]  (copied - symlink/junction unavailable)[/dim]")
     return True
+
+
+# Alias for backwards compatibility
+def create_symlink(source: Path, target: Path, force: bool = False) -> bool:
+    """Deprecated: Use create_link instead."""
+    return create_link(source, target, force)
 
 
 def sync_to_agent(agent_key: str, component: str = "skills"):
@@ -282,36 +589,62 @@ def init(
                 console.print(f"[yellow]⚠[/yellow] {agent['name']}: skills exists (use --force)")
         
         # Sync plugins (if supported)
-        if agent_config["supports_plugins"] and agent_config["plugins_dir"]:
+        if agent["supports_plugins"] and agent["plugins_dir"]:
             source = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
-            target = agent_config["home"] / agent_config["plugins_dir"]
+            target = agent["home"] / agent["plugins_dir"]
             
             if target.is_symlink() and target.resolve() == source.resolve():
                 console.print(f"  [dim]Marketplaces already linked[/dim]")
             elif create_symlink(source, target, force=force):
                 console.print(f"  [green]✓[/green] Marketplaces linked")
 
-        # Sync commands (for OpenCode specifically)
-        if agent_key == "opencode":
-             if agent_config.get("supports_commands"):
-                console.print("  [dim]Syncing OpenCode commands...[/dim]")
-                sync_opencode_commands(force)
-             else:
-                console.print("  [dim]OpenCode commands not supported?[/dim]")
+        # Sync agents (if supported)
+        if agent.get("supports_agents") and agent.get("agents_dir"):
+            source = AGENT_PLUGINS_HOME / "agents"
+            target = agent["home"] / agent["agents_dir"]
+            
+            if target.is_symlink() and target.resolve() == source.resolve():
+                console.print(f"  [dim]Agents already linked[/dim]")
+            elif create_link(source, target, force=force):
+                console.print(f"  [green]✓[/green] Agents linked")
 
-    console.print("[green]Sync complete![/green]")
+        # Sync commands (if supported)
+        if agent.get("supports_commands"):
+            if agent.get("commands_dir"):
+                source = AGENT_PLUGINS_HOME / "commands"
+                target = agent["home"] / agent["commands_dir"]
+                
+                if target.is_symlink() and target.resolve() == source.resolve():
+                    console.print(f"  [dim]Commands already linked[/dim]")
+                elif create_link(source, target, force=force):
+                    console.print(f"  [green]✓[/green] Commands linked")
+            elif agent.get("commands_alt_dir"):
+                # OpenCode uses a different location
+                count = sync_opencode_commands(force)
+                console.print(f"  [green]✓[/green] Synced {count} commands to OpenCode")
+
+        # Sync hooks (if supported)
+        if agent.get("supports_hooks") and agent.get("hooks_dir"):
+            source = AGENT_PLUGINS_HOME / "hooks"
+            target = agent["home"] / agent["hooks_dir"]
+            
+            if target.is_symlink() and target.resolve() == source.resolve():
+                console.print(f"  [dim]Hooks already linked[/dim]")
+            elif create_link(source, target, force=force):
+                console.print(f"  [green]✓[/green] Hooks linked")
+
+    console.print("\n[green]✓ Initialization complete![/green]")
 
 
-def sync_opencode_commands(force: bool):
+def sync_opencode_commands(force: bool) -> int:
     """Sync commands from marketplaces to OpenCode's command directory."""
     marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
     opencode_cmd_dir = Path.home() / ".config" / "opencode" / "command"
     
     if not marketplaces_dir.exists():
-        return
+        return 0
 
     opencode_cmd_dir.mkdir(parents=True, exist_ok=True)
-    console.print("  [cyan]Syncing commands to OpenCode...[/cyan]")
     
     count = 0
     # Walk marketplaces to find commands
@@ -342,7 +675,211 @@ def sync_opencode_commands(force: bool):
                             shutil.copy2(cmd_file, dest_path)
                             count += 1
                             
-    console.print(f"  [green]✓[/green] Synced {count} commands to {opencode_cmd_dir}")
+    return count
+
+
+def get_all_marketplace_dirs() -> List[Path]:
+    """Get all marketplace directories from all known locations.
+    
+    Checks:
+    - ~/.agent/plugins/marketplaces/
+    - ~/.claude/plugins/marketplaces/
+    - Other agent home dirs with marketplaces
+    """
+    marketplace_dirs = []
+    
+    # Check our canonical location
+    agent_mp = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
+    if agent_mp.exists():
+        for mp_dir in agent_mp.iterdir():
+            if mp_dir.is_dir() and not mp_dir.name.startswith("."):
+                marketplace_dirs.append(mp_dir)
+    
+    # Check Claude's location (often the primary source)
+    claude_mp = Path.home() / ".claude" / "plugins" / "marketplaces"
+    if claude_mp.exists():
+        for mp_dir in claude_mp.iterdir():
+            if mp_dir.is_dir() and not mp_dir.name.startswith("."):
+                # Avoid duplicates by name
+                if not any(existing.name == mp_dir.name for existing in marketplace_dirs):
+                    marketplace_dirs.append(mp_dir)
+    
+    return marketplace_dirs
+
+
+def extract_agents_from_marketplaces() -> int:
+    """Extract agent definitions from marketplaces to ~/.agent/agents/.
+    
+    Agents are defined as .md files in:
+    - marketplaces/*/agents/*.md
+    - marketplaces/*/plugins/*/agents/*.md
+    
+    Returns count of agents extracted.
+    """
+    agents_dir = AGENT_PLUGINS_HOME / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    
+    for mp_dir in get_all_marketplace_dirs():
+        if not mp_dir.is_dir() or mp_dir.name.startswith("."):
+            continue
+        
+        # 1. Direct agents folder
+        mp_agents = mp_dir / "agents"
+        if mp_agents.exists():
+            for agent_file in mp_agents.glob("*.md"):
+                dest_name = f"{mp_dir.name}-{agent_file.name}"
+                dest_path = agents_dir / dest_name
+                shutil.copy2(agent_file, dest_path)
+                count += 1
+        
+        # 2. Nested plugin agents
+        plugins_dir = mp_dir / "plugins"
+        if plugins_dir.exists():
+            for plugin_dir in plugins_dir.iterdir():
+                if plugin_dir.is_dir():
+                    plugin_agents = plugin_dir / "agents"
+                    if plugin_agents.exists():
+                        for agent_file in plugin_agents.glob("*.md"):
+                            dest_name = f"{mp_dir.name}-{plugin_dir.name}-{agent_file.name}"
+                            dest_path = agents_dir / dest_name
+                            shutil.copy2(agent_file, dest_path)
+                            count += 1
+    
+    return count
+
+
+def extract_commands_from_marketplaces() -> int:
+    """Extract command definitions from marketplaces to ~/.agent/commands/.
+    
+    Commands are defined as .md files in:
+    - marketplaces/*/commands/*.md
+    - marketplaces/*/.claude/commands/*.md
+    - marketplaces/*/plugins/*/commands/*.md
+    
+    Returns count of commands extracted.
+    """
+    commands_dir = AGENT_PLUGINS_HOME / "commands"
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    
+    for mp_dir in get_all_marketplace_dirs():
+        
+        # 1. Direct commands folder
+        for cmd_source in [mp_dir / "commands", mp_dir / ".claude" / "commands"]:
+            if cmd_source.exists():
+                for cmd_file in cmd_source.glob("*.md"):
+                    dest_name = f"{mp_dir.name}-{cmd_file.name}"
+                    dest_path = commands_dir / dest_name
+                    shutil.copy2(cmd_file, dest_path)
+                    count += 1
+        
+        # 2. Nested plugin commands
+        plugins_dir = mp_dir / "plugins"
+        if plugins_dir.exists():
+            for plugin_dir in plugins_dir.iterdir():
+                if plugin_dir.is_dir():
+                    cmds_dir = plugin_dir / "commands"
+                    if cmds_dir.exists():
+                        for cmd_file in cmds_dir.glob("*.md"):
+                            dest_name = f"{mp_dir.name}-{plugin_dir.name}-{cmd_file.name}"
+                            dest_path = commands_dir / dest_name
+                            shutil.copy2(cmd_file, dest_path)
+                            count += 1
+    
+    return count
+
+
+def extract_hooks_from_marketplaces() -> int:
+    """Extract hook definitions from marketplaces to ~/.agent/hooks/.
+    
+    Hooks are defined as hooks.json + scripts in:
+    - marketplaces/*/hooks/
+    - marketplaces/*/plugins/*/hooks/
+    
+    Returns count of hook sets extracted.
+    """
+    hooks_dir = AGENT_PLUGINS_HOME / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    
+    for mp_dir in get_all_marketplace_dirs():
+        
+        # 1. Direct hooks folder
+        mp_hooks = mp_dir / "hooks"
+        if mp_hooks.exists() and (mp_hooks / "hooks.json").exists():
+            dest_dir = hooks_dir / mp_dir.name
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            shutil.copytree(mp_hooks, dest_dir)
+            count += 1
+        
+        # 2. Nested plugin hooks
+        plugins_dir = mp_dir / "plugins"
+        if plugins_dir.exists():
+            for plugin_dir in plugins_dir.iterdir():
+                if plugin_dir.is_dir():
+                    plugin_hooks = plugin_dir / "hooks"
+                    if plugin_hooks.exists() and (plugin_hooks / "hooks.json").exists():
+                        dest_dir = hooks_dir / f"{mp_dir.name}-{plugin_dir.name}"
+                        if dest_dir.exists():
+                            shutil.rmtree(dest_dir)
+                        shutil.copytree(plugin_hooks, dest_dir)
+                        count += 1
+    
+    return count
+
+
+def extract_skills_from_marketplaces() -> int:
+    """Extract skill definitions from marketplaces to ~/.agent/skills/.
+    
+    Skills are defined as directories containing SKILL.md in:
+    - marketplaces/*/skills/*/
+    - marketplaces/*/plugins/*/skills/*/
+    - Also referenced in marketplace.json plugins[].skills
+    
+    Returns count of skills extracted.
+    """
+    skills_dir = AGENT_PLUGINS_HOME / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    
+    for mp_dir in get_all_marketplace_dirs():
+        
+        # Check marketplace.json for skill references
+        mp_json_paths = [
+            mp_dir / ".claude-plugin" / "marketplace.json",
+            mp_dir / "marketplace.json",
+        ]
+        
+        skill_paths = []
+        for mp_json_path in mp_json_paths:
+            if mp_json_path.exists():
+                with open(mp_json_path) as f:
+                    mp_data = json.load(f)
+                for plugin in mp_data.get("plugins", []):
+                    for skill_ref in plugin.get("skills", []):
+                        # skill_ref is like "./document-skills/xlsx"
+                        skill_path = mp_dir / skill_ref.lstrip("./")
+                        if skill_path.exists() and (skill_path / "SKILL.md").exists():
+                            skill_paths.append(skill_path)
+        
+        # Also look for any SKILL.md files directly
+        for skill_md in mp_dir.rglob("SKILL.md"):
+            skill_path = skill_md.parent
+            if skill_path not in skill_paths:
+                skill_paths.append(skill_path)
+        
+        # Copy each skill
+        for skill_path in skill_paths:
+            skill_name = f"{mp_dir.name}-{skill_path.name}"
+            dest_dir = skills_dir / skill_name
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            shutil.copytree(skill_path, dest_dir)
+            count += 1
+    
+    return count
 
 
 
@@ -363,13 +900,16 @@ def status():
     for agent_key, agent in AGENT_CONFIG.items():
         installed = "✓" if check_agent_installed(agent_key) or agent["home"].exists() else "✗"
         
-        skills_target = agent["home"] / agent["skills_dir"]
-        skills_linked = "✓" if skills_target.is_symlink() else "✗"
+        # Check skills link status (handle agents without skills_dir)
+        skills_linked = "N/A"
+        if agent.get("supports_skills") and agent.get("skills_dir"):
+            skills_target = agent["home"] / agent["skills_dir"]
+            skills_linked = "✓" if skills_target.is_symlink() else "✗"
         
         table.add_row(
             agent["name"],
             installed,
-            skills_linked if agent["supports_skills"] else "N/A",
+            skills_linked,
             str(agent["home"])
         )
     
@@ -387,6 +927,61 @@ def status():
     if skills_dir.exists():
         skills = list(skills_dir.glob("*/SKILL.md"))
         console.print(f"[cyan]Skills:[/cyan] {len(skills)}")
+
+
+@app.command()
+def extract(
+    component: Optional[str] = typer.Argument(
+        None,
+        help="Component to extract: skills, agents, commands, hooks (or all if not specified)"
+    ),
+):
+    """
+    Extract components from marketplaces to ~/.agent/.
+    
+    This copies skills, agents, commands, and hooks from installed
+    marketplaces into the canonical ~/.agent/ directories.
+    
+    Examples:
+        agent-plugins extract           # Extract all components
+        agent-plugins extract skills    # Extract only skills
+        agent-plugins extract agents    # Extract only agents
+    """
+    components = ["skills", "agents", "commands", "hooks"]
+    
+    if component:
+        if component not in components:
+            console.print(f"[red]Unknown component: {component}[/red]")
+            console.print(f"Valid components: {', '.join(components)}")
+            raise typer.Exit(1)
+        components = [component]
+    
+    console.print("[cyan]Extracting components from marketplaces...[/cyan]\n")
+    
+    results = {}
+    
+    if "skills" in components:
+        count = extract_skills_from_marketplaces()
+        results["skills"] = count
+        console.print(f"[green]✓[/green] Extracted {count} skills")
+    
+    if "agents" in components:
+        count = extract_agents_from_marketplaces()
+        results["agents"] = count
+        console.print(f"[green]✓[/green] Extracted {count} agents")
+    
+    if "commands" in components:
+        count = extract_commands_from_marketplaces()
+        results["commands"] = count
+        console.print(f"[green]✓[/green] Extracted {count} commands")
+    
+    if "hooks" in components:
+        count = extract_hooks_from_marketplaces()
+        results["hooks"] = count
+        console.print(f"[green]✓[/green] Extracted {count} hook sets")
+    
+    total = sum(results.values())
+    console.print(f"\n[green]✓ Extracted {total} total components to {AGENT_PLUGINS_HOME}[/green]")
 
 
 @app.command(name="list")
@@ -449,6 +1044,10 @@ def list_plugins():
 @marketplace_app.command("add")
 def marketplace_add(
     source: str = typer.Argument(..., help="GitHub repo (user/repo) or git URL"),
+    github_token: Optional[str] = typer.Option(
+        None, "--github-token", "-t",
+        help="GitHub token for private repos (or set GH_TOKEN/GITHUB_TOKEN env)"
+    ),
 ):
     """
     Add a marketplace from a GitHub repository.
@@ -456,6 +1055,7 @@ def marketplace_add(
     Examples:
         agent-plugins marketplace add anthropics/skills
         agent-plugins marketplace add https://github.com/user/my-plugins.git
+        agent-plugins marketplace add user/private-repo --github-token ghp_xxx
     """
     marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
     marketplaces_dir.mkdir(parents=True, exist_ok=True)
@@ -475,11 +1075,17 @@ def marketplace_add(
         console.print(f"[yellow]Marketplace '{repo_name}' already exists. Use 'update' to refresh.[/yellow]")
         return
     
+    # Use authenticated URL if token available
+    clone_url = get_authenticated_git_url(git_url, github_token)
+    
+    # Show public URL (don't leak token)
     console.print(f"[cyan]Cloning {git_url}...[/cyan]")
+    if get_github_token(github_token):
+        console.print("[dim]  (using authenticated request)[/dim]")
     
     try:
         subprocess.run(
-            ["git", "clone", "--depth", "1", git_url, str(target_dir)],
+            ["git", "clone", "--depth", "1", clone_url, str(target_dir)],
             check=True,
             capture_output=True,
             text=True
@@ -687,6 +1293,182 @@ def check():
         table.add_row(agent["name"], cli_installed, home_exists, skills, plugins)
     
     console.print(table)
+
+
+# =============================================================================
+# Version & Update Commands
+# =============================================================================
+
+# Package version - keep in sync with pyproject.toml
+__version__ = "0.1.0"
+
+
+def get_installed_version() -> str:
+    """Get the currently installed version."""
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("agent-plugins")
+    except Exception:
+        return __version__
+
+
+def get_latest_version() -> Optional[str]:
+    """Fetch the latest version from PyPI or GitHub."""
+    # Try PyPI first
+    try:
+        response = httpx.get(
+            "https://pypi.org/pypi/agent-plugins/json",
+            timeout=5,
+            follow_redirects=True
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("info", {}).get("version")
+    except Exception:
+        pass
+    
+    # Fallback: Try GitHub releases API
+    try:
+        response = httpx.get(
+            "https://api.github.com/repos/jasonkneen/agent-plugins/releases/latest",
+            timeout=5,
+            follow_redirects=True,
+            headers=get_github_auth_headers()
+        )
+        if response.status_code == 200:
+            data = response.json()
+            tag = data.get("tag_name", "")
+            # Remove 'v' prefix if present
+            return tag.lstrip("v") if tag else None
+    except Exception:
+        pass
+    
+    return None
+
+
+@app.command()
+def version(
+    check_update: bool = typer.Option(
+        False, "--check", "-c",
+        help="Check for available updates"
+    ),
+):
+    """Display version and check for updates."""
+    import platform
+    
+    show_banner()
+    
+    installed = get_installed_version()
+    
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="cyan", justify="right")
+    table.add_column("Value", style="white")
+    
+    table.add_row("Version", installed)
+    table.add_row("Python", platform.python_version())
+    table.add_row("Platform", platform.system())
+    table.add_row("Config", str(AGENT_PLUGINS_HOME / "config.json"))
+    
+    if check_update:
+        console.print("[dim]Checking for updates...[/dim]")
+        latest = get_latest_version()
+        if latest:
+            table.add_row("Latest", latest)
+            if latest != installed:
+                table.add_row("", "[yellow]Update available![/yellow]")
+        else:
+            table.add_row("Latest", "[dim]Unable to check[/dim]")
+    
+    panel = Panel(
+        table,
+        title="[bold cyan]Agent Plugins[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2)
+    )
+    console.print(panel)
+    
+    if check_update:
+        console.print("\n[dim]To update, run:[/dim]")
+        console.print("  [cyan]uv tool upgrade agent-plugins[/cyan]")
+        console.print("  [dim]or[/dim]")
+        console.print("  [cyan]pip install --upgrade agent-plugins[/cyan]")
+
+
+@app.command()
+def upgrade(
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Force upgrade even if already on latest"
+    ),
+):
+    """Upgrade agent-plugins to the latest version.
+    
+    This command updates both the CLI tool and refreshes all
+    installed marketplaces.
+    """
+    show_banner()
+    
+    console.print("[cyan]Checking for updates...[/cyan]\n")
+    
+    installed = get_installed_version()
+    latest = get_latest_version()
+    
+    console.print(f"Installed: [cyan]{installed}[/cyan]")
+    if latest:
+        console.print(f"Latest:    [cyan]{latest}[/cyan]")
+    else:
+        console.print("Latest:    [dim]Unable to determine[/dim]")
+    
+    # Check if update is needed
+    needs_update = force or (latest and latest != installed)
+    
+    if not needs_update and not force:
+        console.print("\n[green]✓ Already on the latest version![/green]")
+    else:
+        console.print("\n[cyan]Upgrading agent-plugins...[/cyan]")
+        
+        # Try uv first, then pip
+        upgrade_cmd = None
+        if shutil.which("uv"):
+            upgrade_cmd = ["uv", "tool", "upgrade", "agent-plugins"]
+        elif shutil.which("pip"):
+            upgrade_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "agent-plugins"]
+        
+        if upgrade_cmd:
+            try:
+                result = subprocess.run(
+                    upgrade_cmd,
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    console.print("[green]✓ CLI upgraded successfully![/green]")
+                else:
+                    console.print(f"[yellow]Warning: Upgrade may have failed[/yellow]")
+                    if result.stderr:
+                        console.print(f"[dim]{result.stderr[:200]}[/dim]")
+            except Exception as e:
+                console.print(f"[red]Error upgrading:[/red] {e}")
+        else:
+            console.print("[yellow]No package manager found (uv or pip)[/yellow]")
+            console.print("Please run manually:")
+            console.print("  [cyan]uv tool upgrade agent-plugins[/cyan]")
+    
+    # Also update marketplaces
+    console.print("\n[cyan]Updating marketplaces...[/cyan]")
+    marketplace_update(name=None)
+    
+    # Re-extract components
+    console.print("\n[cyan]Re-extracting components...[/cyan]")
+    
+    skills_count = extract_skills_from_marketplaces()
+    agents_count = extract_agents_from_marketplaces()
+    commands_count = extract_commands_from_marketplaces()
+    hooks_count = extract_hooks_from_marketplaces()
+    
+    console.print(f"[green]✓[/green] Extracted {skills_count} skills, {agents_count} agents, {commands_count} commands, {hooks_count} hooks")
+    
+    console.print("\n[green]✓ Upgrade complete![/green]")
 
 
 def main():
