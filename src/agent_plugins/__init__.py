@@ -1634,19 +1634,31 @@ def upgrade(
         console.print("Latest:    [dim]Unable to determine[/dim]")
     
     # Check if update is needed
-    needs_update = force or (latest and latest != installed)
+    needs_update = force or (latest and latest != installed) or (latest is None)
     
-    if not needs_update and not force:
+    if not needs_update:
         console.print("\n[green]✓ Already on the latest version![/green]")
     else:
-        console.print("\n[cyan]Upgrading agent-plugins...[/cyan]")
+        if latest is None:
+            console.print("\n[yellow]Unable to determine latest version. Attempting upgrade...[/yellow]")
+        else:
+            console.print("\n[cyan]Upgrading agent-plugins...[/cyan]")
         
         # Try uv first, then pip
         upgrade_cmd = None
+        git_source = "git+https://github.com/jms830/agent-plugins.git"
+        use_git_reinstall = latest is None
+        
         if shutil.which("uv"):
-            upgrade_cmd = ["uv", "tool", "upgrade", "agent-plugins"]
+            if use_git_reinstall:
+                upgrade_cmd = ["uv", "tool", "install", "agent-plugins", "--force", "--from", git_source]
+            else:
+                upgrade_cmd = ["uv", "tool", "upgrade", "agent-plugins"]
         elif shutil.which("pip"):
-            upgrade_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "agent-plugins"]
+            if use_git_reinstall:
+                upgrade_cmd = [sys.executable, "-m", "pip", "install", "--force-reinstall", git_source]
+            else:
+                upgrade_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "agent-plugins"]
         
         if upgrade_cmd:
             try:
@@ -1666,7 +1678,20 @@ def upgrade(
         else:
             console.print("[yellow]No package manager found (uv or pip)[/yellow]")
             console.print("Please run manually:")
-            console.print("  [cyan]uv tool upgrade agent-plugins[/cyan]")
+            if use_git_reinstall:
+                console.print("  [cyan]uv tool install agent-plugins --force --from git+https://github.com/jms830/agent-plugins.git[/cyan]")
+                console.print("  [dim]or[/dim]")
+                console.print("  [cyan]pip install --force-reinstall git+https://github.com/jms830/agent-plugins.git[/cyan]")
+            else:
+                console.print("  [cyan]uv tool upgrade agent-plugins[/cyan]")
+                console.print("  [dim]or[/dim]")
+                console.print("  [cyan]pip install --upgrade agent-plugins[/cyan]")
+        
+        if latest is None:
+            console.print("\n[dim]Tip: If you installed from git, you can force reinstall with[/dim]")
+            console.print("  [cyan]uv tool install agent-plugins --force --from git+https://github.com/jms830/agent-plugins.git[/cyan]")
+            console.print("  [dim]or[/dim]")
+            console.print("  [cyan]pip install --force-reinstall git+https://github.com/jms830/agent-plugins.git[/cyan]")
     
     # Also update marketplaces
     console.print("\n[cyan]Updating marketplaces...[/cyan]")
