@@ -6,7 +6,7 @@ Universal plugin manager for AI coding agents. Mirrors Claude Code's plugin/mark
 
 ```bash
 # Install (one-time)
-uv tool install agent-plugins --from git+https://github.com/jasonkneen/agent-plugins.git
+uv tool install agent-plugins --from git+https://github.com/jms830/agent-plugins.git
 
 # Initialize (sets up ~/.agent/ and symlinks to all detected agents)
 agent-plugins init
@@ -35,13 +35,13 @@ Each AI coding agent has its own config directory:
 
 ```bash
 # Using uv (recommended)
-uv tool install agent-plugins --from git+https://github.com/jasonkneen/agent-plugins.git
+uv tool install agent-plugins --from git+https://github.com/jms830/agent-plugins.git
 
 # Or if published to PyPI
 uv tool install agent-plugins
 
 # Or with pip
-pip install git+https://github.com/jasonkneen/agent-plugins.git
+pip install git+https://github.com/jms830/agent-plugins.git
 ```
 
 ## Updating

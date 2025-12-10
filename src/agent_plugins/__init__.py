@@ -1535,7 +1535,7 @@ def get_latest_version() -> Optional[str]:
     # Fallback: Try GitHub releases API
     try:
         response = httpx.get(
-            "https://api.github.com/repos/jasonkneen/agent-plugins/releases/latest",
+            "https://api.github.com/repos/jms830/agent-plugins/releases/latest",
             timeout=5,
             follow_redirects=True,
             headers=get_github_auth_headers()

@@ -10,7 +10,7 @@ This file serves as a reference for supported agents and their folder structures
 
 ## Build & Run
 
-- **Install:** `uv tool install agent-plugins --from git+https://github.com/jasonkneen/agent-plugins.git`
+- **Install:** `uv tool install agent-plugins --from git+https://github.com/jms830/agent-plugins.git`
 - **Run:** `agent-plugins <command>` or `python -m agent_plugins`
 - **Python:** >=3.11
 
