@@ -18,7 +18,7 @@ Each AI coding agent has its own skills/plugins directory:
 
 ```bash
 # Using uv (recommended)
-uv tool install agent-plugins --from git+https://github.com/yourusername/agent-plugins.git
+uv tool install agent-plugins --from git+https://github.com/jms830/agent-plugins.git
 
 # Or with pip
 pip install agent-plugins
