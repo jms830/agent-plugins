@@ -505,12 +505,22 @@ def main_callback(ctx: typer.Context):
         show_banner()
         console.print(ctx.get_help())
 
-# Sub-app for marketplace commands
+# Sub-app for plugin commands (mirrors 'claude plugin')
+plugin_app = typer.Typer(
+    help="Manage plugins and marketplaces",
+    no_args_is_help=True,
+)
+app.add_typer(plugin_app, name="plugin")
+
+# Sub-app for marketplace commands (under plugin)
 marketplace_app = typer.Typer(
     help="Manage plugin marketplaces",
     no_args_is_help=True,
 )
-app.add_typer(marketplace_app, name="marketplace")
+plugin_app.add_typer(marketplace_app, name="marketplace")
+
+# Keep backwards-compatible top-level marketplace command
+app.add_typer(marketplace_app, name="marketplace", hidden=True)
 
 
 # =============================================================================
@@ -1255,6 +1265,233 @@ def list_plugins():
 
 
 # =============================================================================
+# Plugin Commands (mirrors 'claude plugin')
+# =============================================================================
+
+def get_available_plugins() -> List[Dict[str, Any]]:
+    """Get all available plugins from all marketplaces."""
+    plugins = []
+    
+    # Check both agent-plugins and Claude directories
+    mp_dirs = [
+        AGENT_PLUGINS_HOME / "plugins" / "marketplaces",
+        Path.home() / ".claude" / "plugins" / "marketplaces",
+    ]
+    
+    seen = set()
+    for mp_base in mp_dirs:
+        if not mp_base.exists():
+            continue
+        for mp_dir in mp_base.iterdir():
+            if not mp_dir.is_dir() or mp_dir.name.startswith("."):
+                continue
+            
+            mp_json = mp_dir / ".claude-plugin" / "marketplace.json"
+            if mp_json.exists():
+                try:
+                    with open(mp_json) as f:
+                        mp_data = json.load(f)
+                    for plugin in mp_data.get("plugins", []):
+                        plugin_key = f"{plugin.get('name')}@{mp_dir.name}"
+                        if plugin_key not in seen:
+                            seen.add(plugin_key)
+                            plugins.append({
+                                **plugin,
+                                "marketplace": mp_dir.name,
+                                "marketplace_path": mp_dir,
+                            })
+                except Exception:
+                    pass
+    
+    return plugins
+
+
+def get_installed_plugins() -> Dict[str, Any]:
+    """Get installed plugins from config."""
+    config = load_config()
+    return config.get("installed_plugins", {})
+
+
+def save_installed_plugins(plugins: Dict[str, Any]):
+    """Save installed plugins to config."""
+    config = load_config()
+    config["installed_plugins"] = plugins
+    save_config(config)
+
+
+@plugin_app.command("install")
+def plugin_install(
+    plugin: str = typer.Argument(..., help="Plugin name (use plugin@marketplace for specific marketplace)"),
+    scope: str = typer.Option("user", "--scope", "-s", help="Installation scope: user, project, or local"),
+):
+    """
+    Install a plugin from available marketplaces.
+    
+    Examples:
+        agent-plugins plugin install pdf-processing
+        agent-plugins plugin install pdf-processing@anthropic-skills
+    """
+    # Parse plugin@marketplace syntax
+    if "@" in plugin:
+        plugin_name, marketplace_name = plugin.rsplit("@", 1)
+    else:
+        plugin_name = plugin
+        marketplace_name = None
+    
+    available = get_available_plugins()
+    
+    # Find matching plugins
+    matches = []
+    for p in available:
+        if p.get("name") == plugin_name:
+            if marketplace_name is None or p.get("marketplace") == marketplace_name:
+                matches.append(p)
+    
+    if not matches:
+        console.print(f"[red]Error:[/red] Plugin '{plugin_name}' not found in any marketplace")
+        if marketplace_name:
+            console.print(f"[dim]Searched in marketplace: {marketplace_name}[/dim]")
+        console.print("\n[dim]Use 'agent-plugins plugin marketplace list' to see available marketplaces[/dim]")
+        raise typer.Exit(1)
+    
+    if len(matches) > 1 and marketplace_name is None:
+        console.print(f"[yellow]Plugin '{plugin_name}' found in multiple marketplaces:[/yellow]")
+        for m in matches:
+            console.print(f"  - {m.get('name')}@{m.get('marketplace')}")
+        console.print("\n[dim]Use plugin@marketplace syntax to specify which one[/dim]")
+        raise typer.Exit(1)
+    
+    plugin_info = matches[0]
+    mp_name = plugin_info.get("marketplace")
+    mp_path = plugin_info.get("marketplace_path")
+    
+    console.print(f"[cyan]Installing {plugin_name} from {mp_name}...[/cyan]")
+    
+    # Determine plugin source path
+    source = plugin_info.get("source", f"./{plugin_name}")
+    if isinstance(source, str) and source.startswith("./"):
+        plugin_path = mp_path / source.lstrip("./")
+    else:
+        plugin_path = mp_path / "plugins" / plugin_name
+    
+    if not plugin_path.exists():
+        # Try alternate locations
+        for alt in [mp_path / plugin_name, mp_path / "skills" / plugin_name]:
+            if alt.exists():
+                plugin_path = alt
+                break
+    
+    if not plugin_path.exists():
+        console.print(f"[red]Error:[/red] Plugin source not found at {plugin_path}")
+        raise typer.Exit(1)
+    
+    # Track installation
+    installed = get_installed_plugins()
+    installed[plugin_name] = {
+        "marketplace": mp_name,
+        "source": str(plugin_path),
+        "version": plugin_info.get("version", "unknown"),
+        "scope": scope,
+    }
+    save_installed_plugins(installed)
+    
+    console.print(f"[green]✓[/green] Installed {plugin_name}@{mp_name}")
+    
+    # Show plugin details
+    if plugin_info.get("description"):
+        console.print(f"[dim]  {plugin_info.get('description')}[/dim]")
+
+
+@plugin_app.command("uninstall")
+def plugin_uninstall(
+    plugin: str = typer.Argument(..., help="Plugin name to uninstall"),
+):
+    """Uninstall an installed plugin."""
+    installed = get_installed_plugins()
+    
+    if plugin not in installed:
+        console.print(f"[red]Error:[/red] Plugin '{plugin}' is not installed")
+        raise typer.Exit(1)
+    
+    del installed[plugin]
+    save_installed_plugins(installed)
+    
+    console.print(f"[green]✓[/green] Uninstalled {plugin}")
+
+
+# Alias for uninstall
+@plugin_app.command("remove", hidden=True)
+def plugin_remove(plugin: str = typer.Argument(...)):
+    """Remove an installed plugin (alias for uninstall)."""
+    plugin_uninstall(plugin)
+
+
+@plugin_app.command("list")
+def plugin_list():
+    """List installed and available plugins."""
+    installed = get_installed_plugins()
+    available = get_available_plugins()
+    
+    if installed:
+        console.print("\n[bold]Installed plugins:[/bold]\n")
+        for name, info in installed.items():
+            console.print(f"  [green]✓[/green] [bold]{name}[/bold]@{info.get('marketplace', 'unknown')}")
+            if info.get("version"):
+                console.print(f"    [dim]Version: {info.get('version')}[/dim]")
+    
+    console.print("\n[bold]Available plugins:[/bold]\n")
+    
+    # Group by marketplace
+    by_marketplace: Dict[str, List] = {}
+    for p in available:
+        mp = p.get("marketplace", "unknown")
+        if mp not in by_marketplace:
+            by_marketplace[mp] = []
+        by_marketplace[mp].append(p)
+    
+    for mp, plugins in sorted(by_marketplace.items()):
+        console.print(f"  [cyan]{mp}[/cyan]")
+        for p in plugins[:5]:  # Show first 5
+            name = p.get("name", "unknown")
+            desc = p.get("description", "")[:50]
+            installed_marker = "[green]✓[/green] " if name in installed else "  "
+            console.print(f"    {installed_marker}{name}")
+            if desc:
+                console.print(f"      [dim]{desc}[/dim]")
+        if len(plugins) > 5:
+            console.print(f"    [dim]... and {len(plugins) - 5} more[/dim]")
+        console.print()
+
+
+@plugin_app.command("enable")
+def plugin_enable(plugin: str = typer.Argument(..., help="Plugin name to enable")):
+    """Enable a disabled plugin."""
+    installed = get_installed_plugins()
+    
+    if plugin not in installed:
+        console.print(f"[red]Error:[/red] Plugin '{plugin}' is not installed")
+        raise typer.Exit(1)
+    
+    installed[plugin]["enabled"] = True
+    save_installed_plugins(installed)
+    console.print(f"[green]✓[/green] Enabled {plugin}")
+
+
+@plugin_app.command("disable")
+def plugin_disable(plugin: str = typer.Argument(..., help="Plugin name to disable")):
+    """Disable an enabled plugin."""
+    installed = get_installed_plugins()
+    
+    if plugin not in installed:
+        console.print(f"[red]Error:[/red] Plugin '{plugin}' is not installed")
+        raise typer.Exit(1)
+    
+    installed[plugin]["enabled"] = False
+    save_installed_plugins(installed)
+    console.print(f"[green]✓[/green] Disabled {plugin}")
+
+
+# =============================================================================
 # Marketplace Commands
 # =============================================================================
 
@@ -1371,35 +1608,62 @@ def marketplace_update(
 
 @marketplace_app.command(name="list")
 def marketplace_list():
-    """List installed marketplaces."""
+    """List all configured marketplaces."""
     marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
     
-    if not marketplaces_dir.exists():
+    # Also check Claude's marketplace directory
+    claude_mp_dir = Path.home() / ".claude" / "plugins" / "marketplaces"
+    
+    if not marketplaces_dir.exists() and not claude_mp_dir.exists():
         console.print("[yellow]No marketplaces directory. Run 'agent-plugins init' first.[/yellow]")
         return
     
-    table = Table(title="Installed Marketplaces")
-    table.add_column("Name", style="cyan")
-    table.add_column("Plugins", style="green")
-    table.add_column("Description")
+    console.print("\n[bold]Configured marketplaces:[/bold]\n")
     
-    for mp_dir in sorted(marketplaces_dir.iterdir()):
-        if not mp_dir.is_dir() or mp_dir.name.startswith("."):
-            continue
-        
-        mp_json = mp_dir / ".claude-plugin" / "marketplace.json"
-        if mp_json.exists():
-            with open(mp_json) as f:
-                mp_data = json.load(f)
-            plugins_count = len(mp_data.get("plugins", []))
-            description = mp_data.get("description", mp_data.get("metadata", {}).get("description", ""))[:40]
-        else:
-            plugins_count = "?"
-            description = ""
-        
-        table.add_row(mp_dir.name, str(plugins_count), description)
+    seen = set()
     
-    console.print(table)
+    def print_marketplace(mp_dir: Path):
+        if mp_dir.name in seen or mp_dir.name.startswith("."):
+            return
+        seen.add(mp_dir.name)
+        
+        # Determine source type
+        git_config = mp_dir / ".git" / "config"
+        source_info = "Local"
+        
+        if git_config.exists():
+            try:
+                with open(git_config) as f:
+                    content = f.read()
+                    if "url = " in content:
+                        for line in content.split("\n"):
+                            if "url = " in line:
+                                url = line.split("url = ")[1].strip()
+                                if "github.com" in url:
+                                    # Extract owner/repo from GitHub URL
+                                    parts = url.replace(".git", "").split("github.com")[-1].strip("/:")
+                                    source_info = f"GitHub ({parts})"
+                                else:
+                                    source_info = f"Git ({url})"
+                                break
+            except Exception:
+                pass
+        
+        console.print(f"  [cyan]❯[/cyan] [bold]{mp_dir.name}[/bold]")
+        console.print(f"    [dim]Source: {source_info}[/dim]")
+        console.print()
+    
+    # List from agent-plugins directory
+    if marketplaces_dir.exists():
+        for mp_dir in sorted(marketplaces_dir.iterdir()):
+            if mp_dir.is_dir():
+                print_marketplace(mp_dir)
+    
+    # List from Claude's directory (if different)
+    if claude_mp_dir.exists() and claude_mp_dir != marketplaces_dir:
+        for mp_dir in sorted(claude_mp_dir.iterdir()):
+            if mp_dir.is_dir():
+                print_marketplace(mp_dir)
 
 
 # =============================================================================
