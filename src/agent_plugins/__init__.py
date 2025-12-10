@@ -496,6 +496,15 @@ app = typer.Typer(
     add_completion=False,
 )
 
+@app.callback(invoke_without_command=True)
+def main_callback(ctx: typer.Context):
+    """
+    Universal plugin manager for AI coding agents.
+    """
+    if ctx.invoked_subcommand is None:
+        show_banner()
+        console.print("\n[dim]Run 'agent-plugins --help' for usage information[/dim]")
+
 # Sub-app for marketplace commands
 marketplace_app = typer.Typer(help="Manage plugin marketplaces")
 app.add_typer(marketplace_app, name="marketplace")
