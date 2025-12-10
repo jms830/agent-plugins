@@ -27,10 +27,12 @@ from typing import Optional, Dict, List, Any
 import typer
 import yaml
 import httpx
+import readchar
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
+from rich.live import Live
 
 
 # =============================================================================
@@ -63,6 +65,127 @@ def get_authenticated_git_url(url: str, token: Optional[str] = None) -> str:
     if url.startswith("https://github.com/"):
         return url.replace("https://github.com/", f"https://{token}@github.com/")
     return url
+
+
+# =============================================================================
+# Interactive Selection Helpers
+# =============================================================================
+
+def get_key() -> str:
+    """Get a single keypress in a cross-platform way using readchar."""
+    try:
+        key = readchar.readkey()
+        
+        if key == readchar.key.UP or key == readchar.key.CTRL_P:
+            return 'up'
+        if key == readchar.key.DOWN or key == readchar.key.CTRL_N:
+            return 'down'
+        if key == readchar.key.ENTER:
+            return 'enter'
+        if key == readchar.key.ESC:
+            return 'esc'
+        if key == readchar.key.CTRL_C:
+            raise KeyboardInterrupt
+        if key == ' ':
+            return 'space'
+        if key.lower() == 'a':
+            return 'a'
+        return key
+    except Exception:
+        return 'esc'
+
+
+def select_agents_interactive(
+    agents: Dict[str, Dict],
+    prompt_text: str = "Select agents to sync",
+    preselected: List[str] = None
+) -> List[str]:
+    """
+    Interactive multi-select for agents using arrow keys and space.
+    
+    Controls:
+    - ↑/↓: Navigate
+    - Space: Toggle selection
+    - A: Select/deselect all
+    - Enter: Confirm
+    - Esc: Cancel
+    
+    Returns list of selected agent keys.
+    """
+    console = Console()
+    option_keys = list(agents.keys())
+    selected = set(preselected or [])
+    cursor_index = 0
+    
+    def create_selection_panel():
+        """Create the selection panel with current selections."""
+        lines = []
+        for i, key in enumerate(option_keys):
+            agent = agents[key]
+            cursor = "→" if i == cursor_index else " "
+            check = "✓" if key in selected else " "
+            installed = "✓" if check_agent_installed(key) or agent["home"].exists() else " "
+            
+            if i == cursor_index:
+                line = f"[bold cyan]{cursor} [{check}] {agent['name']}[/bold cyan] [dim](installed: {installed})[/dim]"
+            else:
+                line = f"[white]{cursor} [{check}] {agent['name']}[/white] [dim](installed: {installed})[/dim]"
+            lines.append(line)
+        
+        lines.append("")
+        lines.append("[dim]↑/↓: navigate  Space: toggle  A: all  Enter: confirm  Esc: cancel[/dim]")
+        
+        return Panel(
+            "\n".join(lines),
+            title=f"[bold cyan]{prompt_text}[/bold cyan]",
+            border_style="cyan"
+        )
+    
+    # Check if we're in an interactive terminal
+    if not sys.stdin.isatty():
+        # Non-interactive: return preselected or installed agents
+        return list(selected) if selected else [k for k in option_keys if check_agent_installed(k) or agents[k]["home"].exists()]
+    
+    try:
+        with Live(create_selection_panel(), console=console, transient=True, refresh_per_second=10) as live:
+            while True:
+                try:
+                    key = get_key()
+                    
+                    if key == 'up':
+                        cursor_index = (cursor_index - 1) % len(option_keys)
+                    elif key == 'down':
+                        cursor_index = (cursor_index + 1) % len(option_keys)
+                    elif key == 'space':
+                        current_key = option_keys[cursor_index]
+                        if current_key in selected:
+                            selected.remove(current_key)
+                        else:
+                            selected.add(current_key)
+                    elif key == 'a':
+                        # Toggle all
+                        if len(selected) == len(option_keys):
+                            selected.clear()
+                        else:
+                            selected = set(option_keys)
+                    elif key == 'enter':
+                        break
+                    elif key == 'esc':
+                        console.print("\n[yellow]Selection cancelled[/yellow]")
+                        raise typer.Exit(1)
+                    
+                    live.update(create_selection_panel())
+                    
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]Selection cancelled[/yellow]")
+                    raise typer.Exit(1)
+    except Exception as e:
+        # Fallback for non-TTY environments
+        console.print(f"[yellow]Interactive mode unavailable, using defaults[/yellow]")
+        return list(selected) if selected else [k for k in option_keys if check_agent_installed(k) or agents[k]["home"].exists()]
+    
+    return list(selected)
+
 
 # =============================================================================
 # Constants & Agent Configuration
@@ -532,7 +655,11 @@ def sync_to_agent(agent_key: str, component: str = "skills"):
 def init(
     agents: Optional[str] = typer.Option(
         None, "--agents", "-a",
-        help="Comma-separated list of agents to enable (claude,opencode,codex,gemini)"
+        help="Comma-separated list of agents (e.g., claude,opencode,codex). If not specified, shows interactive selector."
+    ),
+    all_agents: bool = typer.Option(
+        False, "--all",
+        help="Enable all supported agents without prompting"
     ),
     force: bool = typer.Option(
         False, "--force", "-f",
@@ -544,6 +671,11 @@ def init(
     
     This creates ~/.agent/ as the canonical location and sets up
     symlinks to each agent's expected skills/plugins directory.
+    
+    Examples:
+        agent-plugins init                    # Interactive agent selection
+        agent-plugins init --all              # Enable all agents
+        agent-plugins init -a claude,opencode # Enable specific agents
     """
     show_banner()
     
@@ -555,11 +687,29 @@ def init(
     
     # Determine which agents to enable
     if agents:
+        # Explicit list provided
         enabled = [a.strip() for a in agents.split(",")]
+    elif all_agents:
+        # All agents
+        enabled = list(AGENT_CONFIG.keys())
     else:
-        enabled = get_installed_agents()
-        if not enabled:
-            enabled = ["claude", "opencode", "codex", "gemini"]
+        # Interactive selection
+        # Pre-select installed agents
+        installed = get_installed_agents()
+        if not installed:
+            installed = ["claude", "opencode", "codex", "gemini"]
+        
+        console.print("")  # Add spacing before interactive selector
+        enabled = select_agents_interactive(
+            AGENT_CONFIG,
+            prompt_text="Select agents to sync (installed agents pre-selected)",
+            preselected=installed
+        )
+        console.print("")  # Add spacing after selection
+    
+    if not enabled:
+        console.print("[yellow]No agents selected. Exiting.[/yellow]")
+        raise typer.Exit(1)
     
     # Save config
     config = load_config()
