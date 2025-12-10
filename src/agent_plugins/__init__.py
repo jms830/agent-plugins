@@ -1325,25 +1325,27 @@ def extract_commands_from_marketplaces() -> int:
     
     for mp_dir in get_all_marketplace_dirs():
         
-        # 1. Direct commands folder
+        # 1. Direct commands folder (preserve relative path)
         for cmd_source in [mp_dir / "commands", mp_dir / ".claude" / "commands"]:
             if cmd_source.exists():
-                for cmd_file in cmd_source.glob("*.md"):
-                    dest_name = f"{mp_dir.name}-{cmd_file.name}"
-                    dest_path = commands_dir / dest_name
+                for cmd_file in cmd_source.rglob("*.md"):
+                    rel_path = cmd_file.relative_to(cmd_source)
+                    dest_path = commands_dir / rel_path
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(cmd_file, dest_path)
                     count += 1
         
-        # 2. Nested plugin commands
+        # 2. Nested plugin commands (preserve relative path)
         plugins_dir = mp_dir / "plugins"
         if plugins_dir.exists():
             for plugin_dir in plugins_dir.iterdir():
                 if plugin_dir.is_dir():
                     cmds_dir = plugin_dir / "commands"
                     if cmds_dir.exists():
-                        for cmd_file in cmds_dir.glob("*.md"):
-                            dest_name = f"{mp_dir.name}-{plugin_dir.name}-{cmd_file.name}"
-                            dest_path = commands_dir / dest_name
+                        for cmd_file in cmds_dir.rglob("*.md"):
+                            rel_path = cmd_file.relative_to(cmds_dir)
+                            dest_path = commands_dir / rel_path
+                            dest_path.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(cmd_file, dest_path)
                             count += 1
     
@@ -1430,12 +1432,20 @@ def extract_skills_from_marketplaces() -> int:
             if skill_path not in skill_paths:
                 skill_paths.append(skill_path)
         
-        # Copy each skill
+        # Copy each skill (preserve relative path after 'skills' directory)
         for skill_path in skill_paths:
-            skill_name = f"{mp_dir.name}-{skill_path.name}"
-            dest_dir = skills_dir / skill_name
+            parts = list(skill_path.parts)
+            if "skills" in parts:
+                idx = parts.index("skills")
+                rel_parts = parts[idx + 1 :]
+            else:
+                rel_parts = [skill_path.name]
+            if not rel_parts:
+                rel_parts = [skill_path.name]
+            dest_dir = skills_dir.joinpath(*rel_parts)
             if dest_dir.exists():
                 shutil.rmtree(dest_dir)
+            dest_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(skill_path, dest_dir)
             count += 1
     
@@ -1612,57 +1622,428 @@ def import_cmd(
         console.print("\n[dim]No new marketplaces to import.[/dim]")
 
 
+def get_all_components() -> Dict[str, List[Dict[str, Any]]]:
+    """Get all installed components (skills, commands, agents, hooks).
+    
+    Returns dict with lists of component info:
+    {
+        "skills": [{"name": "...", "path": Path, "description": "..."}],
+        "commands": [...],
+        "agents": [...],
+        "hooks": [...]
+    }
+    """
+    components = {
+        "skills": [],
+        "commands": [],
+        "agents": [],
+        "hooks": [],
+    }
+    
+    # Skills
+    skills_dir = AGENT_PLUGINS_HOME / "skills"
+    if skills_dir.exists():
+        for f in sorted(skills_dir.glob("*.md")):
+            desc = ""
+            try:
+                content = f.read_text()
+                # Try to extract first line or description
+                lines = content.strip().split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith("#") and not line.startswith("---"):
+                        desc = line[:80]
+                        break
+            except Exception:
+                pass
+            components["skills"].append({
+                "name": f.stem,
+                "path": f,
+                "description": desc,
+                "type": "skill",
+            })
+    
+    # Commands
+    commands_dir = AGENT_PLUGINS_HOME / "commands"
+    if commands_dir.exists():
+        for f in sorted(commands_dir.glob("*.md")):
+            desc = ""
+            try:
+                content = f.read_text()
+                # Try to extract description from frontmatter
+                if content.startswith("---"):
+                    import yaml
+                    parts = content.split("---", 2)
+                    if len(parts) >= 3:
+                        frontmatter = yaml.safe_load(parts[1])
+                        if frontmatter and isinstance(frontmatter, dict):
+                            desc = frontmatter.get("description", "")[:80]
+            except Exception:
+                pass
+            components["commands"].append({
+                "name": f.stem,
+                "path": f,
+                "description": desc,
+                "type": "command",
+            })
+    
+    # Agents
+    agents_dir = AGENT_PLUGINS_HOME / "agents"
+    if agents_dir.exists():
+        for f in sorted(agents_dir.glob("*.md")):
+            desc = ""
+            try:
+                content = f.read_text()
+                lines = content.strip().split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith("#") and not line.startswith("---"):
+                        desc = line[:80]
+                        break
+            except Exception:
+                pass
+            components["agents"].append({
+                "name": f.stem,
+                "path": f,
+                "description": desc,
+                "type": "agent",
+            })
+    
+    # Hooks
+    hooks_dir = AGENT_PLUGINS_HOME / "hooks"
+    if hooks_dir.exists():
+        for f in sorted(hooks_dir.iterdir()):
+            if f.is_file() and not f.name.startswith("."):
+                components["hooks"].append({
+                    "name": f.name,
+                    "path": f,
+                    "description": "",
+                    "type": "hook",
+                })
+    
+    return components
+
+
 @app.command(name="list")
-def list_plugins():
-    """List all installed plugins, skills, and commands."""
-    config = load_config()
+def list_components(
+    component_type: Optional[str] = typer.Argument(
+        None,
+        help="Component type to list: skills, commands, agents, hooks (or all if not specified)"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show descriptions and paths"
+    ),
+    json_output: bool = typer.Option(
+        False, "--json",
+        help="Output as JSON"
+    ),
+):
+    """
+    List installed skills, commands, agents, and hooks.
     
-    marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
+    Examples:
+        agent-plugins list              # List all components (summary)
+        agent-plugins list skills       # List only skills
+        agent-plugins list commands -v  # List commands with descriptions
+        agent-plugins list --json       # Output as JSON
+    """
+    valid_types = ["skills", "commands", "agents", "hooks"]
     
-    if not marketplaces_dir.exists():
-        console.print("[yellow]No marketplaces installed. Run 'agent-plugins init' first.[/yellow]")
+    if component_type and component_type not in valid_types:
+        console.print(f"[red]Error:[/red] Unknown component type: {component_type}")
+        console.print(f"Valid types: {', '.join(valid_types)}")
+        raise typer.Exit(1)
+    
+    components = get_all_components()
+    
+    # Filter if type specified
+    if component_type:
+        components = {component_type: components[component_type]}
+    
+    # JSON output
+    if json_output:
+        output = {}
+        for comp_type, items in components.items():
+            output[comp_type] = [
+                {"name": item["name"], "path": str(item["path"]), "description": item["description"]}
+                for item in items
+            ]
+        console.print(json.dumps(output, indent=2))
         return
     
-    tree = Tree("[bold cyan]Agent Plugins[/bold cyan]")
+    # Summary mode (no type specified, not verbose)
+    if not component_type and not verbose:
+        from rich.table import Table
+        table = Table(title="Installed Components", show_header=True, header_style="bold cyan")
+        table.add_column("Type", style="cyan")
+        table.add_column("Count", justify="right")
+        table.add_column("Location", style="dim")
+        
+        for comp_type, items in components.items():
+            table.add_row(
+                comp_type.capitalize(),
+                str(len(items)),
+                str(AGENT_PLUGINS_HOME / comp_type)
+            )
+        
+        console.print(table)
+        console.print(f"\n[dim]Use 'agent-plugins list <type>' to see items, or add -v for details[/dim]")
+        return
     
-    for mp_dir in sorted(marketplaces_dir.iterdir()):
-        if not mp_dir.is_dir() or mp_dir.name.startswith("."):
+    # Detailed listing
+    for comp_type, items in components.items():
+        if not items:
+            console.print(f"\n[dim]No {comp_type} installed[/dim]")
             continue
         
-        mp_branch = tree.add(f"[cyan]{mp_dir.name}[/cyan]")
+        console.print(f"\n[bold cyan]{comp_type.capitalize()}[/bold cyan] ({len(items)})")
+        console.print("─" * 60)
         
-        # Check for marketplace.json
-        mp_json = mp_dir / ".claude-plugin" / "marketplace.json"
-        if mp_json.exists():
-            with open(mp_json) as f:
-                mp_data = json.load(f)
+        for item in items:
+            name = item["name"]
+            desc = item["description"]
             
-            for plugin in mp_data.get("plugins", []):
-                plugin_name = plugin.get("name", "unknown")
-                plugin_desc = plugin.get("description", "")[:50]
-                plugin_branch = mp_branch.add(f"[green]{plugin_name}[/green] - {plugin_desc}")
-                
-                # Check for skills
-                for skill_path in plugin.get("skills", []):
-                    skill_branch = plugin_branch.add(f"[yellow]skill:[/yellow] {skill_path}")
-        
-        # Also check for direct commands folder
-        commands_dir = mp_dir / "commands"
-        if commands_dir.exists():
-            for cmd_file in commands_dir.glob("*.md"):
-                mp_branch.add(f"[blue]cmd:[/blue] {cmd_file.stem}")
-        
-        # Check for nested plugin commands
-        plugins_dir = mp_dir / "plugins"
-        if plugins_dir.exists():
-            for plugin_dir in plugins_dir.iterdir():
-                if plugin_dir.is_dir():
-                    cmds_dir = plugin_dir / "commands"
-                    if cmds_dir.exists():
-                        for cmd_file in cmds_dir.glob("*.md"):
-                            mp_branch.add(f"[blue]cmd:[/blue] {plugin_dir.name}/{cmd_file.stem}")
+            if verbose:
+                console.print(f"  [green]{name}[/green]")
+                if desc:
+                    console.print(f"    [dim]{desc}[/dim]")
+                console.print(f"    [dim italic]{item['path']}[/dim italic]")
+            else:
+                if desc:
+                    # Truncate description to fit
+                    max_desc_len = 50
+                    if len(desc) > max_desc_len:
+                        desc = desc[:max_desc_len-3] + "..."
+                    console.print(f"  [green]{name}[/green] - [dim]{desc}[/dim]")
+                else:
+                    console.print(f"  [green]{name}[/green]")
+
+
+@app.command(name="show")
+def show_component(
+    name: str = typer.Argument(..., help="Name of the component to show"),
+    component_type: Optional[str] = typer.Option(
+        None, "--type", "-t",
+        help="Component type: skill, command, agent (auto-detected if not specified)"
+    ),
+    raw: bool = typer.Option(
+        False, "--raw", "-r",
+        help="Show raw content without formatting"
+    ),
+):
+    """
+    Show the contents of a skill, command, or agent.
     
-    console.print(tree)
+    Examples:
+        agent-plugins show plugin-manager       # Auto-detect type
+        agent-plugins show memory -t skill      # Explicit type
+        agent-plugins show commit --raw         # Raw markdown output
+    """
+    from rich.markdown import Markdown
+    from rich.syntax import Syntax
+    from rich.panel import Panel
+    
+    # Map singular to plural for directory names
+    type_map = {
+        "skill": "skills",
+        "command": "commands", 
+        "agent": "agents",
+        "hook": "hooks",
+    }
+    
+    # Search order if type not specified
+    search_order = ["commands", "skills", "agents", "hooks"]
+    
+    if component_type:
+        component_type = component_type.lower()
+        if component_type in type_map:
+            component_type = type_map[component_type]
+        if component_type not in search_order:
+            console.print(f"[red]Error:[/red] Unknown type: {component_type}")
+            console.print(f"Valid types: skill, command, agent, hook")
+            raise typer.Exit(1)
+        search_order = [component_type]
+    
+    # Find the component
+    found_path = None
+    found_type = None
+    
+    for comp_type in search_order:
+        comp_dir = AGENT_PLUGINS_HOME / comp_type
+        if comp_dir.exists():
+            # Try exact match first
+            for ext in [".md", ""]:
+                candidate = comp_dir / f"{name}{ext}"
+                if candidate.exists():
+                    found_path = candidate
+                    found_type = comp_type
+                    break
+            if found_path:
+                break
+            
+            # Try case-insensitive match
+            for f in comp_dir.iterdir():
+                if f.stem.lower() == name.lower():
+                    found_path = f
+                    found_type = comp_type
+                    break
+            if found_path:
+                break
+    
+    if not found_path:
+        console.print(f"[red]Error:[/red] Component '{name}' not found")
+        console.print(f"\n[dim]Searched in: {', '.join(search_order)}[/dim]")
+        console.print(f"[dim]Use 'agent-plugins list' to see available components[/dim]")
+        raise typer.Exit(1)
+    
+    # Read content
+    try:
+        content = found_path.read_text()
+    except Exception as e:
+        console.print(f"[red]Error reading file:[/red] {e}")
+        raise typer.Exit(1)
+    
+    # Output
+    if raw:
+        console.print(content)
+    else:
+        # Show header
+        type_label = found_type.rstrip("s").capitalize()
+        console.print(f"\n[bold cyan]{type_label}:[/bold cyan] [green]{found_path.stem}[/green]")
+        console.print(f"[dim]{found_path}[/dim]\n")
+        
+        # Render markdown or show syntax-highlighted content
+        if found_path.suffix == ".md":
+            try:
+                md = Markdown(content)
+                console.print(Panel(md, border_style="dim"))
+            except Exception:
+                console.print(content)
+        else:
+            try:
+                syntax = Syntax(content, "text", theme="monokai", line_numbers=True)
+                console.print(syntax)
+            except Exception:
+                console.print(content)
+
+
+@app.command(name="search")
+def search_components(
+    query: str = typer.Argument(..., help="Search query (searches names and descriptions)"),
+    component_type: Optional[str] = typer.Option(
+        None, "--type", "-t",
+        help="Limit search to: skills, commands, agents, hooks"
+    ),
+    content: bool = typer.Option(
+        False, "--content", "-c",
+        help="Also search file contents (slower)"
+    ),
+    limit: int = typer.Option(
+        20, "--limit", "-n",
+        help="Maximum results to show"
+    ),
+):
+    """
+    Search for skills, commands, and agents by keyword.
+    
+    Examples:
+        agent-plugins search git           # Find anything with 'git'
+        agent-plugins search test -t skill # Search only skills
+        agent-plugins search TODO -c       # Search in file contents too
+    """
+    import re
+    
+    valid_types = ["skills", "commands", "agents", "hooks"]
+    
+    if component_type:
+        if component_type not in valid_types:
+            console.print(f"[red]Error:[/red] Unknown type: {component_type}")
+            console.print(f"Valid types: {', '.join(valid_types)}")
+            raise typer.Exit(1)
+    
+    components = get_all_components()
+    
+    # Filter by type if specified
+    if component_type:
+        components = {component_type: components[component_type]}
+    
+    query_lower = query.lower()
+    query_pattern = re.compile(re.escape(query), re.IGNORECASE)
+    
+    results = []
+    
+    for comp_type, items in components.items():
+        for item in items:
+            match_in = []
+            
+            # Search in name
+            if query_lower in item["name"].lower():
+                match_in.append("name")
+            
+            # Search in description
+            if item["description"] and query_lower in item["description"].lower():
+                match_in.append("description")
+            
+            # Search in content if requested
+            if content and item["path"].exists():
+                try:
+                    file_content = item["path"].read_text()
+                    if query_pattern.search(file_content):
+                        if "name" not in match_in and "description" not in match_in:
+                            match_in.append("content")
+                except Exception:
+                    pass
+            
+            if match_in:
+                results.append({
+                    **item,
+                    "match_in": match_in,
+                })
+    
+    # Sort results: name matches first, then description, then content
+    def sort_key(r):
+        if "name" in r["match_in"]:
+            return (0, r["name"])
+        elif "description" in r["match_in"]:
+            return (1, r["name"])
+        else:
+            return (2, r["name"])
+    
+    results.sort(key=sort_key)
+    
+    # Limit results
+    if len(results) > limit:
+        results = results[:limit]
+        truncated = True
+    else:
+        truncated = False
+    
+    if not results:
+        console.print(f"[yellow]No results found for '{query}'[/yellow]")
+        if not content:
+            console.print(f"[dim]Tip: Use -c to also search file contents[/dim]")
+        return
+    
+    console.print(f"\n[bold cyan]Search Results for '{query}'[/bold cyan] ({len(results)} found)\n")
+    
+    for item in results:
+        type_label = item["type"]
+        type_color = {"skill": "yellow", "command": "blue", "agent": "magenta", "hook": "cyan"}.get(type_label, "white")
+        
+        match_str = ", ".join(item["match_in"])
+        
+        console.print(f"  [{type_color}]{type_label}[/{type_color}] [green]{item['name']}[/green] [dim](match: {match_str})[/dim]")
+        if item["description"]:
+            # Highlight query in description
+            desc = item["description"]
+            highlighted = query_pattern.sub(f"[bold yellow]{query}[/bold yellow]", desc)
+            console.print(f"       [dim]{highlighted}[/dim]")
+    
+    if truncated:
+        console.print(f"\n[dim]... and more. Use --limit to show more results.[/dim]")
+    
+    console.print(f"\n[dim]Use 'agent-plugins show <name>' to view details[/dim]")
 
 
 # =============================================================================
