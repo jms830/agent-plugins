@@ -609,6 +609,54 @@ def ensure_directory_structure():
         d.mkdir(parents=True, exist_ok=True)
 
 
+def install_builtin_commands():
+    """Install built-in commands from the package to ~/.agent/commands/.
+    
+    This copies commands bundled with agent-plugins (like /plugin-manager)
+    to the canonical commands directory so they're available to all agents.
+    
+    Returns count of commands installed.
+    """
+    import importlib.resources
+    
+    commands_dir = AGENT_PLUGINS_HOME / "commands"
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    
+    count = 0
+    
+    # Try to find bundled commands in the package
+    try:
+        # Python 3.9+ approach
+        if hasattr(importlib.resources, 'files'):
+            package_commands = importlib.resources.files('agent_plugins').joinpath('commands')
+            if package_commands.is_dir():
+                for item in package_commands.iterdir():
+                    if item.name.endswith('.md'):
+                        dest = commands_dir / item.name
+                        # Always overwrite built-in commands to ensure latest version
+                        dest.write_text(item.read_text())
+                        count += 1
+        else:
+            # Fallback for older Python
+            import pkg_resources
+            package_dir = Path(pkg_resources.resource_filename('agent_plugins', 'commands'))
+            if package_dir.exists():
+                for cmd_file in package_dir.glob('*.md'):
+                    dest = commands_dir / cmd_file.name
+                    shutil.copy2(cmd_file, dest)
+                    count += 1
+    except Exception:
+        # If package resources fail, try relative path (development mode)
+        dev_commands = Path(__file__).parent / "commands"
+        if dev_commands.exists():
+            for cmd_file in dev_commands.glob('*.md'):
+                dest = commands_dir / cmd_file.name
+                shutil.copy2(cmd_file, dest)
+                count += 1
+    
+    return count
+
+
 def is_junction(path: Path) -> bool:
     """Check if a path is a Windows junction point."""
     if sys.platform != "win32":
@@ -762,6 +810,11 @@ def init(
     ensure_directory_structure()
     console.print(f"[green]✓[/green] Created {AGENT_PLUGINS_HOME}")
     
+    # Install built-in commands (like /plugin-manager)
+    builtin_count = install_builtin_commands()
+    if builtin_count > 0:
+        console.print(f"[green]✓[/green] Installed {builtin_count} built-in command(s)")
+    
     # Determine which agents to enable
     if agents:
         # Explicit list provided
@@ -837,18 +890,21 @@ def init(
 
         # Sync commands (if supported)
         if agent.get("supports_commands"):
-            if agent.get("commands_dir"):
-                source = AGENT_PLUGINS_HOME / "commands"
+            source = AGENT_PLUGINS_HOME / "commands"
+            
+            # Determine target - some agents use alt location (e.g., OpenCode)
+            if agent.get("commands_alt_dir"):
+                target = agent["commands_alt_dir"]
+            elif agent.get("commands_dir"):
                 target = agent["home"] / agent["commands_dir"]
-                
+            else:
+                target = None
+            
+            if target:
                 if target.is_symlink() and target.resolve() == source.resolve():
                     console.print(f"  [dim]Commands already linked[/dim]")
                 elif create_link(source, target, force=force):
-                    console.print(f"  [green]✓[/green] Commands linked")
-            elif agent.get("commands_alt_dir"):
-                # OpenCode uses a different location
-                count = sync_opencode_commands(force)
-                console.print(f"  [green]✓[/green] Synced {count} commands to OpenCode")
+                    console.print(f"  [green]✓[/green] Commands linked → {target}")
 
         # Sync hooks (if supported)
         if agent.get("supports_hooks") and agent.get("hooks_dir"):
@@ -863,46 +919,35 @@ def init(
     console.print("\n[green]✓ Initialization complete![/green]")
 
 
-def sync_opencode_commands(force: bool) -> int:
-    """Sync commands from marketplaces to OpenCode's command directory."""
-    marketplaces_dir = AGENT_PLUGINS_HOME / "plugins" / "marketplaces"
-    opencode_cmd_dir = Path.home() / ".config" / "opencode" / "command"
+def sync_agent_commands(agent_key: str, force: bool = False) -> bool:
+    """Sync commands to an agent's command directory via symlink.
     
-    if not marketplaces_dir.exists():
-        return 0
-
-    opencode_cmd_dir.mkdir(parents=True, exist_ok=True)
+    For agents with a standard commands_dir, creates a symlink from
+    agent_home/commands_dir → ~/.agent/commands/
     
-    count = 0
-    # Walk marketplaces to find commands
-    for mp_dir in marketplaces_dir.iterdir():
-        if not mp_dir.is_dir() or mp_dir.name.startswith("."):
-            continue
-            
-        # 1. Direct commands folder
-        commands_dir = mp_dir / "commands"
-        if commands_dir.exists():
-            for cmd_file in commands_dir.glob("*.md"):
-                dest_name = f"claude-{mp_dir.name}-{cmd_file.name}"
-                dest_path = opencode_cmd_dir / dest_name
-                shutil.copy2(cmd_file, dest_path)
-                count += 1
-        
-        # 2. Nested plugin commands
-        plugins_dir = mp_dir / "plugins"
-        if plugins_dir.exists():
-            for plugin_dir in plugins_dir.iterdir():
-                if plugin_dir.is_dir():
-                    cmds_dir = plugin_dir / "commands"
-                    if cmds_dir.exists():
-                        for cmd_file in cmds_dir.glob("*.md"):
-                            # Format: claude-marketplace-plugin-command.md
-                            dest_name = f"claude-{mp_dir.name}-{plugin_dir.name}-{cmd_file.name}"
-                            dest_path = opencode_cmd_dir / dest_name
-                            shutil.copy2(cmd_file, dest_path)
-                            count += 1
-                            
-    return count
+    For agents with commands_alt_dir (like OpenCode), creates a symlink
+    to the alternate location.
+    
+    Returns True if synced, False if skipped.
+    """
+    agent = AGENT_CONFIG.get(agent_key)
+    if not agent or not agent.get("supports_commands"):
+        return False
+    
+    source = AGENT_PLUGINS_HOME / "commands"
+    if not source.exists():
+        source.mkdir(parents=True, exist_ok=True)
+    
+    # Determine target directory
+    if agent.get("commands_dir"):
+        target = agent["home"] / agent["commands_dir"]
+    elif agent.get("commands_alt_dir"):
+        target = agent["commands_alt_dir"]
+    else:
+        return False
+    
+    # Create symlink
+    return create_link(source, target, force=force)
 
 
 def get_all_marketplace_dirs() -> List[Path]:
@@ -1748,9 +1793,23 @@ def sync(
             elif create_symlink(source, target, force=force):
                 console.print(f"  [green]✓[/green] Marketplaces linked")
 
-        # Sync commands (for OpenCode specifically)
-        if agent_key == "opencode" and agent_config.get("supports_commands"):
-            sync_opencode_commands(force)
+        # Sync commands (if supported)
+        if agent_config.get("supports_commands"):
+            source = AGENT_PLUGINS_HOME / "commands"
+            
+            # Determine target - some agents use alt location (e.g., OpenCode)
+            if agent_config.get("commands_alt_dir"):
+                target = agent_config["commands_alt_dir"]
+            elif agent_config.get("commands_dir"):
+                target = agent_config["home"] / agent_config["commands_dir"]
+            else:
+                target = None
+            
+            if target:
+                if create_link(source, target, force=force):
+                    console.print(f"  [green]✓[/green] Commands linked")
+                elif target.is_symlink():
+                    console.print(f"  [dim]Commands already linked[/dim]")
 
     console.print("[green]Sync complete![/green]")
 
