@@ -226,7 +226,9 @@ AGENT_CONFIG = {
         "skills_dir": "skills",
         "commands_dir": "command",           # .opencode/command/ (singular!)
         "commands_alt_dir": Path.home() / ".config" / "opencode" / "command",
-        "agents_dir": None,
+        "agents_dir": "agent",               # .opencode/agent/ (singular!)
+        "agents_alt_dir": Path.home() / ".config" / "opencode" / "agent",
+        "skills_alt_dir": Path.home() / ".config" / "opencode" / "skills",
         "hooks_dir": None,
         "plugins_dir": None,
         "command_format": "markdown",
@@ -235,7 +237,7 @@ AGENT_CONFIG = {
         "supports_plugins": False,
         "supports_skills": True,
         "supports_commands": True,
-        "supports_agents": False,
+        "supports_agents": True,
         "supports_hooks": False,
     },
     "codex": {
@@ -591,19 +593,28 @@ def ensure_directory_structure():
     Creates the full Claude-compatible directory structure:
     ~/.agent/
     ├── plugins/
-    │   └── marketplaces/     # Git repos with marketplace.json
-    ├── skills/               # SKILL.md files
-    ├── agents/               # Agent definitions
-    ├── commands/             # Slash commands
-    └── hooks/                # Hook scripts
+    │   ├── marketplaces/     # Git repos with marketplace.json
+    │   └── cache/            # Installed plugins (Claude-compatible)
+    ├── skills/               # User SKILL.md files
+    ├── agents/               # User agent definitions
+    ├── commands/             # User slash commands
+    ├── hooks/                # Hook scripts
+    └── opencode/             # OpenCode-specific merged structure
+        ├── command/          # User + marketplace commands
+        ├── agent/            # User + marketplace agents
+        └── skills/           # User + marketplace skills
     """
     dirs = [
         AGENT_PLUGINS_HOME,
         AGENT_PLUGINS_HOME / "plugins" / "marketplaces",
+        AGENT_PLUGINS_HOME / "plugins" / "cache",
         AGENT_PLUGINS_HOME / "skills",
         AGENT_PLUGINS_HOME / "agents",
         AGENT_PLUGINS_HOME / "commands",
         AGENT_PLUGINS_HOME / "hooks",
+        AGENT_PLUGINS_HOME / "opencode" / "command",
+        AGENT_PLUGINS_HOME / "opencode" / "agent",
+        AGENT_PLUGINS_HOME / "opencode" / "skills",
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
@@ -798,6 +809,211 @@ def setup_marketplace_metadata_symlinks(force: bool = False) -> Dict[str, str]:
             results[filename] = f"symlink_failed: {e}"
     
     return results
+
+
+def setup_plugin_cache_symlink(force: bool = False) -> Dict[str, str]:
+    """Set up symlink for plugin cache from Claude to agent-plugins.
+    
+    Claude stores installed plugins in ~/.claude/plugins/cache/.
+    We move this to ~/.agent/plugins/cache/ and symlink back.
+    
+    This allows both Claude and agent-plugins to share the same cache.
+    
+    Returns dict with action taken: {"cache": "action"}
+    """
+    results = {}
+    
+    claude_cache = AGENT_CONFIG["claude"]["home"] / "plugins" / "cache"
+    agent_cache = AGENT_PLUGINS_HOME / "plugins" / "cache"
+    
+    # Ensure our cache dir exists
+    agent_cache.mkdir(parents=True, exist_ok=True)
+    
+    # If Claude cache is already a symlink to our location, done
+    if claude_cache.is_symlink():
+        if claude_cache.resolve() == agent_cache.resolve():
+            results["cache"] = "already_linked"
+            return results
+        elif force:
+            claude_cache.unlink()
+        else:
+            results["cache"] = "symlink_exists_different_target"
+            return results
+    
+    # If Claude cache exists as a real directory, move contents
+    if claude_cache.exists() and claude_cache.is_dir():
+        # Move contents to our location
+        for item in claude_cache.iterdir():
+            dest = agent_cache / item.name
+            if not dest.exists():
+                shutil.move(str(item), str(dest))
+        
+        # Remove the now-empty directory
+        try:
+            shutil.rmtree(claude_cache)
+        except Exception:
+            pass
+        
+        results["cache"] = "moved_and_symlinked"
+    else:
+        results["cache"] = "symlinked"
+    
+    # Create symlink from Claude to our cache
+    claude_cache.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        claude_cache.symlink_to(agent_cache)
+    except OSError as e:
+        results["cache"] = f"symlink_failed: {e}"
+    
+    return results
+
+
+def build_opencode_structure() -> Dict[str, Any]:
+    """Build the OpenCode-specific merged structure with symlinks.
+    
+    Creates ~/.agent/opencode/ with:
+    - command/
+        - <user-command>.md → symlink to ~/.agent/commands/<cmd>.md (flat user commands at root)
+        - marketplace/<plugin>/ → cache/<marketplace>/<plugin>/<version>/commands/
+    - agent/
+        - <user-agent>.md → symlink to ~/.agent/agents/<agent>.md
+        - marketplace/<plugin>/ → cache/<marketplace>/<plugin>/<version>/agents/
+    - skills/
+        - <user-skill>/ → symlink to ~/.agent/skills/<skill>/
+        - marketplace/<plugin>/ → cache/<marketplace>/<plugin>/<version>/skills/
+    
+    This gives OpenCode a merged view where:
+    - User content is at root level: /my-command, @my-agent, skills_my_skill
+    - Marketplace content is under /marketplace/: /marketplace/commit/commit
+    
+    Returns dict with counts for each component type.
+    """
+    results = {
+        "commands": {"user": 0, "marketplace": 0, "plugins": []},
+        "agents": {"user": 0, "marketplace": 0, "plugins": []},
+        "skills": {"user": 0, "marketplace": 0, "plugins": []},
+    }
+    
+    opencode_dir = AGENT_PLUGINS_HOME / "opencode"
+    cache_dir = AGENT_PLUGINS_HOME / "plugins" / "cache"
+    
+    # Component types and their source/target directories
+    components = [
+        ("commands", "command", "commands", "commands"),   # (name, opencode_subdir, user_dir, cache_subdir)
+        ("agents", "agent", "agents", "agents"),
+        ("skills", "skills", "skills", "skills"),
+    ]
+    
+    for comp_name, oc_subdir, user_dir, cache_subdir in components:
+        oc_path = opencode_dir / oc_subdir
+        oc_path.mkdir(parents=True, exist_ok=True)
+        user_source = AGENT_PLUGINS_HOME / user_dir
+        
+        # Clean existing symlinks in the opencode directory (but keep marketplace subdir)
+        if oc_path.exists():
+            for item in oc_path.iterdir():
+                if item.name != "marketplace" and item.is_symlink():
+                    item.unlink()
+        
+        # Link user content at root level (flat files or directories for skills)
+        if user_source.exists():
+            if comp_name == "skills":
+                # Skills are directories containing SKILL.md
+                for skill_dir in user_source.iterdir():
+                    if skill_dir.is_dir() and not skill_dir.name.startswith("."):
+                        skill_md = skill_dir / "SKILL.md"
+                        if skill_md.exists():
+                            link_path = oc_path / skill_dir.name
+                            if link_path.is_symlink():
+                                link_path.unlink()
+                            elif link_path.exists():
+                                shutil.rmtree(link_path)
+                            try:
+                                link_path.symlink_to(skill_dir)
+                                results[comp_name]["user"] += 1
+                            except OSError:
+                                pass
+            else:
+                # Commands and agents are .md files
+                for item in user_source.iterdir():
+                    if item.is_file() and item.suffix == ".md":
+                        link_path = oc_path / item.name
+                        if link_path.is_symlink():
+                            link_path.unlink()
+                        try:
+                            link_path.symlink_to(item)
+                            results[comp_name]["user"] += 1
+                        except OSError:
+                            pass
+        
+        # Link marketplace content under marketplace/<plugin>/
+        marketplace_dir = oc_path / "marketplace"
+        
+        # Clean and recreate marketplace directory
+        if marketplace_dir.exists():
+            shutil.rmtree(marketplace_dir)
+        marketplace_dir.mkdir(parents=True, exist_ok=True)
+        
+        if cache_dir.exists():
+            for marketplace in cache_dir.iterdir():
+                if not marketplace.is_dir() or marketplace.name.startswith("."):
+                    continue
+                
+                for plugin in marketplace.iterdir():
+                    if not plugin.is_dir():
+                        continue
+                    
+                    # Find version directory (usually just one)
+                    for version in plugin.iterdir():
+                        if not version.is_dir():
+                            continue
+                        
+                        source_dir = version / cache_subdir
+                        if source_dir.exists() and source_dir.is_dir():
+                            # Check if there's actual content
+                            has_content = False
+                            if comp_name == "skills":
+                                # Check for SKILL.md in subdirectories
+                                has_content = any(source_dir.glob("*/SKILL.md"))
+                            else:
+                                # Check for .md files
+                                has_content = any(source_dir.glob("*.md"))
+                            
+                            if has_content:
+                                # Create symlink: marketplace/<plugin>/ → cache/.../
+                                link_path = marketplace_dir / plugin.name
+                                if link_path.is_symlink():
+                                    link_path.unlink()
+                                elif link_path.exists():
+                                    shutil.rmtree(link_path)
+                                
+                                try:
+                                    link_path.symlink_to(source_dir)
+                                    results[comp_name]["marketplace"] += 1
+                                    if plugin.name not in results[comp_name]["plugins"]:
+                                        results[comp_name]["plugins"].append(plugin.name)
+                                except OSError:
+                                    pass
+    
+    # Auto-sanitize the cache to fix common YAML issues
+    sanitize_results = sanitize_plugin_cache()
+    results["sanitized"] = sanitize_results["fixed"]
+    
+    return results
+
+
+def build_merged_commands_directory() -> Dict[str, Any]:
+    """DEPRECATED: Use build_opencode_structure() instead.
+    
+    This function is kept for backwards compatibility but now just calls
+    build_opencode_structure() and returns a simplified result.
+    """
+    results = build_opencode_structure()
+    return {
+        "user_linked": results["commands"]["user"] > 0,
+        "plugin_commands": results["commands"]["marketplace"],
+        "marketplaces": results["commands"]["plugins"],
+    }
 
 
 def import_marketplaces(source: Optional[str] = None) -> Dict[str, Any]:
@@ -1104,17 +1320,63 @@ def init(
             console.print(f"[yellow]⚠[/yellow] Unknown agent: {agent_key}")
             continue
         
-        # Skills symlink
+        console.print(f"\n  [bold]{agent['name']}[/bold]")
+        
+        # OpenCode uses special merged structure from ~/.agent/opencode/
+        if agent_key == "opencode":
+            # Commands: opencode/command/ (has user + marketplace)
+            source = AGENT_PLUGINS_HOME / "opencode" / "command"
+            target = agent.get("commands_alt_dir") or (agent["home"] / agent["commands_dir"] if agent.get("commands_dir") else None)
+            
+            if target:
+                if target.is_symlink() and target.resolve() == source.resolve():
+                    console.print(f"    [dim]Commands: already linked[/dim]")
+                elif create_link(source, target, force=force):
+                    console.print(f"    [green]✓[/green] Commands → {target}")
+            
+            # Agents: opencode/agent/ (has user + marketplace)
+            source = AGENT_PLUGINS_HOME / "opencode" / "agent"
+            target = agent.get("agents_alt_dir") or (agent["home"] / agent["agents_dir"] if agent.get("agents_dir") else None)
+            
+            if target:
+                if target.is_symlink() and target.resolve() == source.resolve():
+                    console.print(f"    [dim]Agents: already linked[/dim]")
+                elif create_link(source, target, force=force):
+                    console.print(f"    [green]✓[/green] Agents → {target}")
+            
+            # Skills: opencode/skills/ (has user + marketplace for opencode-skills plugin)
+            source = AGENT_PLUGINS_HOME / "opencode" / "skills"
+            target = agent.get("skills_alt_dir") or (agent["home"] / agent["skills_dir"] if agent.get("skills_dir") else None)
+            
+            if target:
+                if target.is_symlink() and target.resolve() == source.resolve():
+                    console.print(f"    [dim]Skills: already linked[/dim]")
+                elif create_link(source, target, force=force):
+                    console.print(f"    [green]✓[/green] Skills → {target}")
+            
+            # Hooks (if supported)
+            if agent.get("supports_hooks") and agent.get("hooks_dir"):
+                source = AGENT_PLUGINS_HOME / "hooks"
+                target = agent["home"] / agent["hooks_dir"]
+                if target.is_symlink() and target.resolve() == source.resolve():
+                    console.print(f"    [dim]Hooks: already linked[/dim]")
+                elif create_link(source, target, force=force):
+                    console.print(f"    [green]✓[/green] Hooks linked")
+            
+            continue  # Skip standard agent setup for OpenCode
+        
+        # Standard agent setup (Claude and others)
+        # Skills symlink (user skills only - Claude uses plugin system for marketplace)
         if agent["supports_skills"]:
             source = AGENT_PLUGINS_HOME / "skills"
             target = agent["home"] / agent["skills_dir"]
             
             if target.is_symlink() and target.resolve() == source.resolve():
-                console.print(f"[dim]  {agent['name']}: skills already linked[/dim]")
+                console.print(f"    [dim]Skills: already linked[/dim]")
             elif create_symlink(source, target, force=force):
-                console.print(f"[green]✓[/green] {agent['name']}: skills → {target}")
+                console.print(f"    [green]✓[/green] Skills → {target}")
             else:
-                console.print(f"[yellow]⚠[/yellow] {agent['name']}: skills exists (use --force)")
+                console.print(f"    [yellow]⚠[/yellow] Skills: exists (use --force)")
         
         # Sync plugins (if supported)
         if agent["supports_plugins"] and agent["plugins_dir"]:
@@ -1122,25 +1384,25 @@ def init(
             target = agent["home"] / agent["plugins_dir"]
             
             if target.is_symlink() and target.resolve() == source.resolve():
-                console.print(f"  [dim]Marketplaces already linked[/dim]")
+                console.print(f"    [dim]Marketplaces: already linked[/dim]")
             elif create_symlink(source, target, force=force):
-                console.print(f"  [green]✓[/green] Marketplaces linked")
+                console.print(f"    [green]✓[/green] Marketplaces linked")
 
-        # Sync agents (if supported)
+        # Sync agents (user agents only - Claude uses plugin system for marketplace)
         if agent.get("supports_agents") and agent.get("agents_dir"):
             source = AGENT_PLUGINS_HOME / "agents"
             target = agent["home"] / agent["agents_dir"]
             
             if target.is_symlink() and target.resolve() == source.resolve():
-                console.print(f"  [dim]Agents already linked[/dim]")
+                console.print(f"    [dim]Agents: already linked[/dim]")
             elif create_link(source, target, force=force):
-                console.print(f"  [green]✓[/green] Agents linked")
+                console.print(f"    [green]✓[/green] Agents linked")
 
-        # Sync commands (if supported)
+        # Sync commands (user commands only - Claude uses plugin system for marketplace)
         if agent.get("supports_commands"):
             source = AGENT_PLUGINS_HOME / "commands"
             
-            # Determine target - some agents use alt location (e.g., OpenCode)
+            # Determine target - some agents use alt location
             if agent.get("commands_alt_dir"):
                 target = agent["commands_alt_dir"]
             elif agent.get("commands_dir"):
@@ -1150,9 +1412,9 @@ def init(
             
             if target:
                 if target.is_symlink() and target.resolve() == source.resolve():
-                    console.print(f"  [dim]Commands already linked[/dim]")
+                    console.print(f"    [dim]Commands: already linked[/dim]")
                 elif create_link(source, target, force=force):
-                    console.print(f"  [green]✓[/green] Commands linked → {target}")
+                    console.print(f"    [green]✓[/green] Commands → {target}")
 
         # Sync hooks (if supported)
         if agent.get("supports_hooks") and agent.get("hooks_dir"):
@@ -1160,13 +1422,25 @@ def init(
             target = agent["home"] / agent["hooks_dir"]
             
             if target.is_symlink() and target.resolve() == source.resolve():
-                console.print(f"  [dim]Hooks already linked[/dim]")
+                console.print(f"    [dim]Hooks: already linked[/dim]")
             elif create_link(source, target, force=force):
-                console.print(f"  [green]✓[/green] Hooks linked")
+                console.print(f"    [green]✓[/green] Hooks linked")
 
     # Set up marketplace metadata symlinks (Claude integration)
     if "claude" in enabled:
-        console.print("\n[cyan]Setting up marketplace metadata sync...[/cyan]")
+        console.print("\n[cyan]Setting up Claude plugin sync...[/cyan]")
+        
+        # Set up plugin cache symlink
+        cache_results = setup_plugin_cache_symlink(force=force)
+        cache_action = cache_results.get("cache", "")
+        if cache_action == "already_linked":
+            console.print(f"  [dim]Plugin cache: already linked[/dim]")
+        elif "symlinked" in cache_action or "moved" in cache_action:
+            console.print(f"  [green]✓[/green] Plugin cache: {cache_action}")
+        elif "failed" in cache_action:
+            console.print(f"  [yellow]⚠[/yellow] Plugin cache: {cache_action}")
+        
+        # Set up metadata symlinks
         metadata_results = setup_marketplace_metadata_symlinks(force=force)
         
         for filename, action in metadata_results.items():
@@ -1195,14 +1469,173 @@ def init(
                 failed_names = [f["name"] for f in import_results["failed"]]
                 console.print(f"[yellow]⚠[/yellow] Failed to import: {', '.join(failed_names)}")
             
-            # Extract components from newly imported marketplaces
+            # Extract skills and agents from newly imported marketplaces
+            # NOTE: Commands, agents, and skills are NOT extracted - they stay in cache
+            # and are accessed via symlinks in the opencode/ structure
             if import_results["imported"]:
-                console.print("\n[cyan]Extracting components from imported marketplaces...[/cyan]")
-                skills = extract_skills_from_marketplaces()
-                agents_count = extract_agents_from_marketplaces()
-                commands = extract_commands_from_marketplaces()
+                console.print("\n[cyan]Extracting hooks from imported marketplaces...[/cyan]")
                 hooks = extract_hooks_from_marketplaces()
-                console.print(f"[green]✓[/green] Extracted {skills} skills, {agents_count} agents, {commands} commands, {hooks} hooks")
+                console.print(f"[green]✓[/green] Extracted {hooks} hooks")
+    
+    # Build OpenCode merged structure (commands, agents, skills)
+    if "opencode" in enabled:
+        console.print("\n[cyan]Building OpenCode merged structure...[/cyan]")
+        oc_results = build_opencode_structure()
+        
+        for comp_name in ["commands", "agents", "skills"]:
+            comp = oc_results[comp_name]
+            user_count = comp["user"]
+            mp_count = comp["marketplace"]
+            
+            if user_count > 0 or mp_count > 0:
+                plugins_str = f" ({', '.join(comp['plugins'])})" if comp['plugins'] else ""
+                console.print(f"  [green]✓[/green] {comp_name.capitalize()}: {user_count} user, {mp_count} marketplace{plugins_str}")
+            else:
+                console.print(f"  [dim]{comp_name.capitalize()}: none found[/dim]")
+        
+        # Show sanitization results
+        if oc_results.get("sanitized", 0) > 0:
+            console.print(f"  [green]✓[/green] Sanitized {oc_results['sanitized']} files with YAML issues")
+        
+        # Check and optionally install opencode-skills plugin
+        console.print("\n[cyan]Checking opencode-skills plugin...[/cyan]")
+        opencode_config = Path.home() / ".config" / "opencode" / "opencode.json"
+        has_skills_plugin = False
+        
+        try:
+            if opencode_config.exists():
+                with open(opencode_config) as f:
+                    config = json.load(f)
+                    plugins = config.get("plugin", [])
+                    has_skills_plugin = "opencode-skills" in plugins
+        except (json.JSONDecodeError, IOError) as e:
+            console.print(f"  [yellow]⚠[/yellow] Could not read OpenCode config: {e}")
+        
+        if has_skills_plugin:
+            console.print(f"  [dim]opencode-skills: already configured[/dim]")
+        else:
+            console.print(f"  [yellow]opencode-skills not found in config[/yellow]")
+            console.print(f"  [dim]Skills require opencode-skills plugin to work as tools[/dim]")
+            
+            # Ask user if they want to install it (with fallback for non-interactive)
+            try:
+                install_prompt = typer.confirm(
+                    "  Would you like to add opencode-skills to your OpenCode config?",
+                    default=True
+                )
+            except Exception:
+                # Non-interactive mode or error - skip
+                install_prompt = False
+                console.print(f"  [dim]Skipping (non-interactive mode)[/dim]")
+            
+            if install_prompt:
+                try:
+                    # Add to config
+                    if opencode_config.exists():
+                        with open(opencode_config) as f:
+                            config = json.load(f)
+                    else:
+                        config = {"$schema": "https://opencode.ai/config.json"}
+                    
+                    if "plugin" not in config:
+                        config["plugin"] = []
+                    
+                    if "opencode-skills" not in config["plugin"]:
+                        config["plugin"].append("opencode-skills")
+                    
+                    opencode_config.parent.mkdir(parents=True, exist_ok=True)
+                    with open(opencode_config, "w") as f:
+                        json.dump(config, f, indent=2)
+                    
+                    console.print(f"  [green]✓[/green] Added opencode-skills to config")
+                    console.print(f"  [dim]Restart OpenCode for changes to take effect[/dim]")
+                except Exception as e:
+                    console.print(f"  [yellow]⚠[/yellow] Could not update config: {e}")
+        
+        # Install the sanitize plugin for OpenCode
+        console.print("\n[cyan]Installing agent-plugins sanitize plugin...[/cyan]")
+        plugin_dir = Path.home() / ".config" / "opencode" / "plugin"
+        plugin_file = plugin_dir / "agent-plugins-sanitize.ts"
+        
+        sanitize_plugin_content = '''/**
+ * Agent Plugins Sanitizer for OpenCode
+ * 
+ * Auto-sanitizes plugin cache files on OpenCode startup to fix common YAML
+ * frontmatter issues that cause parse errors.
+ */
+
+import type { Plugin } from "@opencode-ai/plugin"
+import { Glob } from "bun"
+import { join } from "path"
+import os from "os"
+
+async function sanitizeYamlFrontmatter(filePath: string): Promise<boolean> {
+  try {
+    const file = Bun.file(filePath)
+    const content = await file.text()
+    
+    if (!content.startsWith("---")) return false
+    
+    const endIdx = content.indexOf("---", 3)
+    if (endIdx === -1) return false
+    
+    let frontmatter = content.substring(3, endIdx)
+    const rest = content.substring(endIdx)
+    const originalFm = frontmatter
+    
+    // Remove empty field values
+    frontmatter = frontmatter.replace(/^(\\w+):\\s*$/gm, '')
+    
+    // Quote strings with colons
+    frontmatter = frontmatter.replace(
+      /^(\\w+):\\s+([^"'\\n].*:.*[^"'\\n])$/gm,
+      (match, field, value) => {
+        if (value.startsWith('"') || value.startsWith("'")) return match
+        return `${field}: "${value.replace(/"/g, '\\\\"')}"`
+      }
+    )
+    
+    frontmatter = frontmatter.replace(/\\n{3,}/g, '\\n\\n')
+    
+    if (frontmatter !== originalFm) {
+      await Bun.write(filePath, "---" + frontmatter + rest)
+      return true
+    }
+    return false
+  } catch { return false }
+}
+
+async function sanitizePluginCache(): Promise<{ scanned: number; fixed: number }> {
+  const cacheDir = join(os.homedir(), ".agent/plugins/cache")
+  const results = { scanned: 0, fixed: 0 }
+  
+  try {
+    const glob = new Glob("**/*.md")
+    for await (const file of glob.scan({ cwd: cacheDir, absolute: true })) {
+      results.scanned++
+      if (await sanitizeYamlFrontmatter(file)) results.fixed++
+    }
+  } catch {}
+  
+  return results
+}
+
+export const AgentPluginsSanitize: Plugin = async () => {
+  const results = await sanitizePluginCache()
+  if (results.fixed > 0) {
+    console.log(`[agent-plugins] Sanitized ${results.fixed} files with YAML issues`)
+  }
+  return {}
+}
+'''
+        
+        try:
+            plugin_dir.mkdir(parents=True, exist_ok=True)
+            plugin_file.write_text(sanitize_plugin_content)
+            console.print(f"  [green]✓[/green] Installed agent-plugins-sanitize.ts")
+            console.print(f"  [dim]This will auto-fix YAML issues when OpenCode starts[/dim]")
+        except Exception as e:
+            console.print(f"  [yellow]⚠[/yellow] Could not install sanitize plugin: {e}")
 
     console.print("\n[green]✓ Initialization complete![/green]")
 
@@ -1268,49 +1701,45 @@ def get_all_marketplace_dirs() -> List[Path]:
 
 
 def extract_agents_from_marketplaces() -> int:
-    """Extract agent definitions from marketplaces to ~/.agent/agents/.
+    """DEPRECATED: Agents should stay in cache, not be extracted.
     
-    Agents are defined as .md files in:
-    - marketplaces/*/agents/*.md
-    - marketplaces/*/plugins/*/agents/*.md
+    Marketplace agents are now accessed via symlinks in ~/.agent/opencode/agent/marketplace/.
+    Use build_opencode_structure() instead.
     
-    Returns count of agents extracted.
+    This function is kept for backwards compatibility but now just returns 0.
     """
-    agents_dir = AGENT_PLUGINS_HOME / "agents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
-    
-    for mp_dir in get_all_marketplace_dirs():
-        if not mp_dir.is_dir() or mp_dir.name.startswith("."):
-            continue
-        
-        # 1. Direct agents folder
-        mp_agents = mp_dir / "agents"
-        if mp_agents.exists():
-            for agent_file in mp_agents.glob("*.md"):
-                dest_name = f"{mp_dir.name}-{agent_file.name}"
-                dest_path = agents_dir / dest_name
-                shutil.copy2(agent_file, dest_path)
-                count += 1
-        
-        # 2. Nested plugin agents
-        plugins_dir = mp_dir / "plugins"
-        if plugins_dir.exists():
-            for plugin_dir in plugins_dir.iterdir():
-                if plugin_dir.is_dir():
-                    plugin_agents = plugin_dir / "agents"
-                    if plugin_agents.exists():
-                        for agent_file in plugin_agents.glob("*.md"):
-                            dest_name = f"{mp_dir.name}-{plugin_dir.name}-{agent_file.name}"
-                            dest_path = agents_dir / dest_name
-                            shutil.copy2(agent_file, dest_path)
-                            count += 1
-    
-    return count
+    import warnings
+    warnings.warn(
+        "extract_agents_from_marketplaces() is deprecated. "
+        "Agents now stay in cache and are accessed via opencode/agent/marketplace/. "
+        "Use build_opencode_structure() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    return 0
 
 
 def extract_commands_from_marketplaces() -> int:
-    """Extract command definitions from marketplaces to ~/.agent/commands/.
+    """DEPRECATED: Commands should stay in cache, not be extracted.
+    
+    Use build_merged_commands_directory() instead, which creates symlinks
+    to commands in the plugin cache without copying them.
+    
+    This function is kept for backwards compatibility but now just returns 0.
+    """
+    import warnings
+    warnings.warn(
+        "extract_commands_from_marketplaces() is deprecated. "
+        "Commands now stay in cache and are accessed via all-commands/. "
+        "Use build_merged_commands_directory() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    return 0
+
+
+def _extract_commands_from_marketplaces_legacy() -> int:
+    """Legacy function to extract commands (kept for reference).
     
     Commands are defined as .md files in:
     - marketplaces/*/commands/*.md
@@ -1393,63 +1822,22 @@ def extract_hooks_from_marketplaces() -> int:
 
 
 def extract_skills_from_marketplaces() -> int:
-    """Extract skill definitions from marketplaces to ~/.agent/skills/.
+    """DEPRECATED: Skills should stay in cache, not be extracted.
     
-    Skills are defined as directories containing SKILL.md in:
-    - marketplaces/*/skills/*/
-    - marketplaces/*/plugins/*/skills/*/
-    - Also referenced in marketplace.json plugins[].skills
+    Marketplace skills are now accessed via symlinks in ~/.agent/opencode/skills/marketplace/.
+    Use build_opencode_structure() instead.
     
-    Returns count of skills extracted.
+    This function is kept for backwards compatibility but now just returns 0.
     """
-    skills_dir = AGENT_PLUGINS_HOME / "skills"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
-    
-    for mp_dir in get_all_marketplace_dirs():
-        
-        # Check marketplace.json for skill references
-        mp_json_paths = [
-            mp_dir / ".claude-plugin" / "marketplace.json",
-            mp_dir / "marketplace.json",
-        ]
-        
-        skill_paths = []
-        for mp_json_path in mp_json_paths:
-            if mp_json_path.exists():
-                with open(mp_json_path) as f:
-                    mp_data = json.load(f)
-                for plugin in mp_data.get("plugins", []):
-                    for skill_ref in plugin.get("skills", []):
-                        # skill_ref is like "./document-skills/xlsx"
-                        skill_path = mp_dir / skill_ref.lstrip("./")
-                        if skill_path.exists() and (skill_path / "SKILL.md").exists():
-                            skill_paths.append(skill_path)
-        
-        # Also look for any SKILL.md files directly
-        for skill_md in mp_dir.rglob("SKILL.md"):
-            skill_path = skill_md.parent
-            if skill_path not in skill_paths:
-                skill_paths.append(skill_path)
-        
-        # Copy each skill (preserve relative path after 'skills' directory)
-        for skill_path in skill_paths:
-            parts = list(skill_path.parts)
-            if "skills" in parts:
-                idx = parts.index("skills")
-                rel_parts = parts[idx + 1 :]
-            else:
-                rel_parts = [skill_path.name]
-            if not rel_parts:
-                rel_parts = [skill_path.name]
-            dest_dir = skills_dir.joinpath(*rel_parts)
-            if dest_dir.exists():
-                shutil.rmtree(dest_dir)
-            dest_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(skill_path, dest_dir)
-            count += 1
-    
-    return count
+    import warnings
+    warnings.warn(
+        "extract_skills_from_marketplaces() is deprecated. "
+        "Skills now stay in cache and are accessed via opencode/skills/marketplace/. "
+        "Use build_opencode_structure() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    return 0
 
 
 
@@ -1503,55 +1891,224 @@ def status():
 def extract(
     component: Optional[str] = typer.Argument(
         None,
-        help="Component to extract: skills, agents, commands, hooks (or all if not specified)"
+        help="Component to extract: hooks (or 'hooks' if not specified)"
     ),
 ):
     """
-    Extract components from marketplaces to ~/.agent/.
+    Extract hooks from marketplaces to ~/.agent/.
     
-    This copies skills, agents, commands, and hooks from installed
-    marketplaces into the canonical ~/.agent/ directories.
+    NOTE: Commands, agents, and skills are NO LONGER extracted.
+    They remain in the plugin cache (~/.agent/plugins/cache/) and are
+    accessed via symlinks in ~/.agent/opencode/.
+    
+    Use 'agent-plugins rebuild' to refresh the OpenCode merged structure.
     
     Examples:
-        agent-plugins extract           # Extract all components
-        agent-plugins extract skills    # Extract only skills
-        agent-plugins extract agents    # Extract only agents
+        agent-plugins extract           # Extract hooks
+        agent-plugins extract hooks     # Extract hooks
     """
-    components = ["skills", "agents", "commands", "hooks"]
+    deprecated_components = ["commands", "skills", "agents"]
     
-    if component:
-        if component not in components:
-            console.print(f"[red]Unknown component: {component}[/red]")
-            console.print(f"Valid components: {', '.join(components)}")
-            raise typer.Exit(1)
-        components = [component]
+    if component and component in deprecated_components:
+        console.print(f"[yellow]{component.capitalize()} are no longer extracted.[/yellow]")
+        console.print("They stay in the plugin cache and are accessed via symlinks.")
+        console.print("Use 'agent-plugins rebuild' to refresh the OpenCode structure.")
+        raise typer.Exit(0)
     
-    console.print("[cyan]Extracting components from marketplaces...[/cyan]\n")
+    if component and component != "hooks":
+        console.print(f"[red]Unknown component: {component}[/red]")
+        console.print("Only 'hooks' can be extracted. Commands, agents, and skills use symlinks.")
+        raise typer.Exit(1)
     
-    results = {}
+    console.print("[cyan]Extracting hooks from marketplaces...[/cyan]\n")
     
-    if "skills" in components:
-        count = extract_skills_from_marketplaces()
-        results["skills"] = count
-        console.print(f"[green]✓[/green] Extracted {count} skills")
+    hooks = extract_hooks_from_marketplaces()
+    console.print(f"[green]✓[/green] Extracted {hooks} hook sets")
     
-    if "agents" in components:
-        count = extract_agents_from_marketplaces()
-        results["agents"] = count
-        console.print(f"[green]✓[/green] Extracted {count} agents")
+    console.print(f"\n[green]✓ Extracted {hooks} total components to {AGENT_PLUGINS_HOME}[/green]")
+    console.print("\n[dim]Note: Commands, agents, and skills are accessed via symlinks.[/dim]")
+    console.print("[dim]Run 'agent-plugins rebuild' to refresh the OpenCode structure.[/dim]")
+
+
+@app.command(name="rebuild")
+def rebuild_cmd():
+    """
+    Rebuild the OpenCode merged structure.
     
-    if "commands" in components:
-        count = extract_commands_from_marketplaces()
-        results["commands"] = count
-        console.print(f"[green]✓[/green] Extracted {count} commands")
+    This recreates symlinks in ~/.agent/opencode/ pointing to:
+    - User content in ~/.agent/{commands,agents,skills}/
+    - Marketplace content in ~/.agent/plugins/cache/
     
-    if "hooks" in components:
-        count = extract_hooks_from_marketplaces()
-        results["hooks"] = count
-        console.print(f"[green]✓[/green] Extracted {count} hook sets")
+    Run this after installing new plugins to make their content
+    available to OpenCode.
     
-    total = sum(results.values())
-    console.print(f"\n[green]✓ Extracted {total} total components to {AGENT_PLUGINS_HOME}[/green]")
+    Examples:
+        agent-plugins rebuild
+    """
+    console.print("[cyan]Rebuilding OpenCode structure...[/cyan]\n")
+    
+    results = build_opencode_structure()
+    
+    for comp_name in ["commands", "agents", "skills"]:
+        comp = results[comp_name]
+        user_count = comp["user"]
+        mp_count = comp["marketplace"]
+        
+        if user_count > 0 or mp_count > 0:
+            plugins_str = f" ({', '.join(comp['plugins'])})" if comp['plugins'] else ""
+            console.print(f"[green]✓[/green] {comp_name.capitalize()}: {user_count} user, {mp_count} marketplace{plugins_str}")
+        else:
+            console.print(f"[dim]{comp_name.capitalize()}: none found[/dim]")
+    
+    # Show sanitization results
+    if results.get("sanitized", 0) > 0:
+        console.print(f"[green]✓[/green] Sanitized {results['sanitized']} files with YAML issues")
+    
+    # Count totals
+    opencode_dir = AGENT_PLUGINS_HOME / "opencode"
+    
+    for comp_name, subdir, pattern in [
+        ("commands", "command", "*.md"),
+        ("agents", "agent", "*.md"),
+        ("skills", "skills", "*/SKILL.md"),
+    ]:
+        comp_dir = opencode_dir / subdir
+        if comp_dir.exists():
+            result = subprocess.run(
+                ["find", "-L", str(comp_dir), "-name", pattern.split("/")[-1], "-type", "f"],
+                capture_output=True, text=True
+            )
+            count = len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+            console.print(f"  Total {comp_name}: {count}")
+
+
+# Alias for backwards compatibility
+@app.command(name="rebuild-commands", hidden=True)
+def rebuild_commands_cmd():
+    """Alias for 'rebuild' command (deprecated)."""
+    rebuild_cmd()
+
+
+def sanitize_yaml_frontmatter(file_path: Path) -> bool:
+    """Fix common YAML frontmatter issues in a markdown file.
+    
+    Fixes:
+    - Empty field values (e.g., 'tools:' with nothing after)
+    - Unquoted strings with colons (e.g., 'description: foo: bar')
+    - Removes problematic empty fields
+    
+    Returns True if file was modified.
+    """
+    try:
+        content = file_path.read_text()
+        
+        # Check if file has frontmatter
+        if not content.startswith("---"):
+            return False
+        
+        # Find end of frontmatter
+        end_idx = content.find("---", 3)
+        if end_idx == -1:
+            return False
+        
+        frontmatter = content[3:end_idx]
+        rest = content[end_idx:]
+        
+        import re
+        original_fm = frontmatter
+        
+        # Remove lines that are just "fieldname:" with nothing after
+        # This handles: "tools:" or "tools:\n" 
+        frontmatter = re.sub(r'^(\w+):\s*$', '', frontmatter, flags=re.MULTILINE)
+        
+        # Quote string values that contain colons (common issue)
+        # Match: fieldname: some text with: colons in it
+        # But not: fieldname: "already quoted" or fieldname: 'already quoted'
+        def quote_if_needed(match):
+            field = match.group(1)
+            value = match.group(2)
+            # Skip if already quoted or is a simple value without colons
+            if value.startswith('"') or value.startswith("'"):
+                return match.group(0)
+            if ':' in value:
+                # Escape any existing quotes and wrap in quotes
+                escaped = value.replace('"', '\\"')
+                return f'{field}: "{escaped}"'
+            return match.group(0)
+        
+        # Match field: value where value contains a colon
+        frontmatter = re.sub(
+            r'^(\w+):\s+(.+:.+)$',
+            quote_if_needed,
+            frontmatter,
+            flags=re.MULTILINE
+        )
+        
+        # Clean up multiple blank lines
+        frontmatter = re.sub(r'\n{3,}', '\n\n', frontmatter)
+        
+        if frontmatter != original_fm:
+            new_content = "---" + frontmatter + rest
+            file_path.write_text(new_content)
+            return True
+        
+        return False
+    except Exception:
+        return False
+
+
+def sanitize_plugin_cache() -> Dict[str, int]:
+    """Sanitize all markdown files in the plugin cache.
+    
+    Fixes common YAML frontmatter issues that cause parsers to fail.
+    
+    Returns dict with counts: {"scanned": int, "fixed": int}
+    """
+    cache_dir = AGENT_PLUGINS_HOME / "plugins" / "cache"
+    results = {"scanned": 0, "fixed": 0, "files_fixed": []}
+    
+    if not cache_dir.exists():
+        return results
+    
+    for md_file in cache_dir.rglob("*.md"):
+        results["scanned"] += 1
+        if sanitize_yaml_frontmatter(md_file):
+            results["fixed"] += 1
+            results["files_fixed"].append(str(md_file.relative_to(cache_dir)))
+    
+    return results
+
+
+@app.command(name="sanitize")
+def sanitize_cmd():
+    """
+    Sanitize plugin cache files to fix common YAML issues.
+    
+    Some marketplace plugins have malformed YAML frontmatter that causes
+    OpenCode's parser to fail. This command fixes common issues like
+    empty field values (e.g., 'tools:' with no value).
+    
+    Run this after installing new plugins if you see YAML parse errors.
+    
+    Examples:
+        agent-plugins sanitize
+    """
+    console.print("[cyan]Sanitizing plugin cache...[/cyan]\n")
+    
+    results = sanitize_plugin_cache()
+    
+    console.print(f"Scanned: {results['scanned']} files")
+    
+    if results["fixed"] > 0:
+        console.print(f"[green]✓[/green] Fixed {results['fixed']} files:")
+        for f in results["files_fixed"][:10]:  # Show first 10
+            console.print(f"    - {f}")
+        if len(results["files_fixed"]) > 10:
+            console.print(f"    ... and {len(results['files_fixed']) - 10} more")
+    else:
+        console.print("[dim]No issues found[/dim]")
+    
+    console.print("\n[green]✓ Sanitization complete![/green]")
 
 
 @app.command(name="import")
@@ -1606,14 +2163,17 @@ def import_cmd(
         for f in results["failed"]:
             console.print(f"  - {f['name']}: {f['error']}")
     
-    # Extract components if requested and we imported something
+    # Extract hooks and rebuild OpenCode structure if we imported something
     if extract_after and results["imported"]:
-        console.print("\n[cyan]Extracting components from imported marketplaces...[/cyan]")
-        skills = extract_skills_from_marketplaces()
-        agents_count = extract_agents_from_marketplaces()
-        commands = extract_commands_from_marketplaces()
+        console.print("\n[cyan]Extracting hooks from imported marketplaces...[/cyan]")
         hooks = extract_hooks_from_marketplaces()
-        console.print(f"[green]✓[/green] Extracted {skills} skills, {agents_count} agents, {commands} commands, {hooks} hooks")
+        console.print(f"[green]✓[/green] Extracted {hooks} hooks")
+        
+        # Rebuild OpenCode structure (commands, agents, skills via symlinks)
+        console.print("\n[cyan]Rebuilding OpenCode structure...[/cyan]")
+        oc_results = build_opencode_structure()
+        total_mp = sum(r["marketplace"] for r in oc_results.values())
+        console.print(f"[green]✓[/green] Linked {total_mp} marketplace components")
     
     total_imported = len(results["imported"])
     if total_imported > 0:
@@ -2773,15 +3333,16 @@ def upgrade(
     console.print("\n[cyan]Updating marketplaces...[/cyan]")
     marketplace_update(name=None)
     
-    # Re-extract components
-    console.print("\n[cyan]Re-extracting components...[/cyan]")
+    # Extract hooks and rebuild OpenCode structure
+    console.print("\n[cyan]Extracting hooks and rebuilding structure...[/cyan]")
     
-    skills_count = extract_skills_from_marketplaces()
-    agents_count = extract_agents_from_marketplaces()
-    commands_count = extract_commands_from_marketplaces()
     hooks_count = extract_hooks_from_marketplaces()
+    console.print(f"[green]✓[/green] Extracted {hooks_count} hooks")
     
-    console.print(f"[green]✓[/green] Extracted {skills_count} skills, {agents_count} agents, {commands_count} commands, {hooks_count} hooks")
+    # Rebuild OpenCode structure (commands, agents, skills via symlinks)
+    oc_results = build_opencode_structure()
+    total_mp = sum(r["marketplace"] for r in oc_results.values())
+    console.print(f"[green]✓[/green] Linked {total_mp} marketplace components via symlinks")
     
     console.print("\n[green]✓ Upgrade complete![/green]")
 
